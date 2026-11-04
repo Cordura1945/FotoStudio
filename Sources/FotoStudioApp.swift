@@ -21,46 +21,82 @@ struct FotoStudioApp: App {
 struct HomeView: View {
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    Text("Was möchtest du tun?")
-                        .font(.title3)
-                        .foregroundStyle(.secondary)
+            ZStack {
+                LinearGradient(colors: [Color(red: 0.02, green: 0.03, blue: 0.10), .black],
+                               startPoint: .top, endPoint: .bottom).ignoresSafeArea()
+                RadialGradient(colors: [Color.blue.opacity(0.35), .clear], center: .topTrailing,
+                               startRadius: 10, endRadius: 420).ignoresSafeArea()
+                RadialGradient(colors: [Color.purple.opacity(0.28), .clear], center: .bottomLeading,
+                               startRadius: 10, endRadius: 420).ignoresSafeArea()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        header
+                        Text("Was möchtest du tun?")
+                            .font(.headline)
+                            .foregroundStyle(.white.opacity(0.9))
+                            .padding(.top, 8)
 
-                    NavigationLink {
-                        EditorScreen()
-                    } label: {
-                        HomeTile(title: "Bearb. & Retusche",
-                                 subtitle: "Korrekturen, Looks, Zuschneiden, Retusche, Freistellen",
-                                 icon: "slider.horizontal.3",
-                                 colors: [.blue, .purple])
-                    }
-                    .buttonStyle(.plain)
+                        NavigationLink {
+                            EditorScreen()
+                        } label: {
+                            HomeTile(title: "Bearb. & Retusche",
+                                     subtitle: "Korrekturen, Looks, Zuschneiden, Retusche, Freistellen",
+                                     icon: "slider.horizontal.3",
+                                     colors: [Color(red: 0.25, green: 0.35, blue: 0.95), Color(red: 0.62, green: 0.25, blue: 0.85)])
+                        }
+                        .buttonStyle(.plain)
 
-                    NavigationLink {
-                        CombineScreen()
-                    } label: {
-                        HomeTile(title: "Fotos kombinieren",
-                                 subtitle: "Collagen, Ebenen, Überblenden, Freistellen",
-                                 icon: "square.on.square",
-                                 colors: [.orange, .pink])
-                    }
-                    .buttonStyle(.plain)
+                        NavigationLink {
+                            CombineScreen()
+                        } label: {
+                            HomeTile(title: "Fotos kombinieren",
+                                     subtitle: "Collagen, Ebenen, Überblenden, Freistellen",
+                                     icon: "square.on.square",
+                                     colors: [Color(red: 0.98, green: 0.55, blue: 0.15), Color(red: 0.92, green: 0.25, blue: 0.45)])
+                        }
+                        .buttonStyle(.plain)
 
-                    NavigationLink {
-                        PSDScreen()
-                    } label: {
-                        HomeTile(title: "PSD Bearbeitung",
-                                 subtitle: "PSD-Dateien öffnen, Ebenen bearbeiten, als PSD/PNG/JPEG sichern",
-                                 icon: "square.3.layers.3d",
-                                 colors: [.teal, .green])
+                        NavigationLink {
+                            PSDScreen()
+                        } label: {
+                            HomeTile(title: "PSD Bearbeitung",
+                                     subtitle: "PSD-Dateien öffnen, Ebenen bearbeiten, als PSD/PNG/JPEG sichern",
+                                     icon: "square.3.layers.3d",
+                                     colors: [Color(red: 0.08, green: 0.68, blue: 0.62), Color(red: 0.15, green: 0.78, blue: 0.42)])
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 30)
                 }
-                .padding()
             }
-            .navigationTitle("FotoStudio")
+            .toolbar(.hidden, for: .navigationBar)
         }
+    }
+
+    private var header: some View {
+        HStack(spacing: 14) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(LinearGradient(colors: [.cyan, .blue, .purple], startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .frame(width: 56, height: 56)
+                    .shadow(color: .cyan.opacity(0.5), radius: 12)
+                Image(systemName: "camera.aperture")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 0) {
+                    Text("Foto").foregroundStyle(.white)
+                    Text("Studio").foregroundStyle(Color.cyan)
+                }
+                .font(.system(size: 36, weight: .bold))
+                Text("Professionelle Bildbearbeitung")
+                    .font(.caption).foregroundStyle(.white.opacity(0.65))
+            }
+            Spacer()
+        }
+        .padding(.top, 16)
     }
 }
 
@@ -73,23 +109,26 @@ struct HomeTile: View {
     var body: some View {
         HStack(spacing: 16) {
             Image(systemName: icon)
-                .font(.system(size: 36, weight: .semibold))
-                .frame(width: 56)
+                .font(.system(size: 30, weight: .semibold))
+                .frame(width: 60, height: 60)
+                .background(Color.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 16))
             VStack(alignment: .leading, spacing: 4) {
                 Text(title).font(.title2.bold())
-                Text(subtitle).font(.footnote).opacity(0.9)
+                Text(subtitle).font(.footnote).opacity(0.92)
                     .multilineTextAlignment(.leading)
             }
             Spacer()
-            Image(systemName: "chevron.right").opacity(0.7)
+            Image(systemName: "chevron.right").opacity(0.8)
         }
         .foregroundStyle(.white)
-        .padding(20)
-        .frame(maxWidth: .infinity, minHeight: 130)
+        .padding(18)
+        .frame(maxWidth: .infinity, minHeight: 120)
         .background(
             LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing),
-            in: RoundedRectangle(cornerRadius: 22)
+            in: RoundedRectangle(cornerRadius: 24)
         )
+        .overlay(RoundedRectangle(cornerRadius: 24).strokeBorder(Color.white.opacity(0.25), lineWidth: 1))
+        .shadow(color: colors[0].opacity(0.45), radius: 14, y: 6)
     }
 }
 
