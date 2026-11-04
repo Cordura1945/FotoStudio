@@ -304,7 +304,10 @@ enum PSDParser {
         }
     }
 
+    static var progress: Double = 0
+
     static func parse(_ data: Data) throws -> PSDDocument {
+        progress = 0.02
         let bytes = [UInt8](data)
         var r = ByteReader(bytes)
         guard try r.str(4) == "8BPS" else { throw PSDError(msg: "Das ist keine PSD-Datei.") }
@@ -398,7 +401,10 @@ enum PSDParser {
                 }
 
                 var skippedAdjustments = 0
+                var recIndex = 0
                 for rec in recs {
+                    recIndex += 1
+                    progress = 0.05 + 0.93 * Double(recIndex) / Double(max(1, recs.count))
                     var planes: [Int: [UInt8]] = [:]
                     for ch in rec.channels {
                         let start = r.p
@@ -678,6 +684,8 @@ final class PSDModel: ObservableObject {
     @Published var preview: UIImage?
     @Published var busy = false
     @Published var message: String?
+    @Published var progress: Double?      // 0…1, nil = kein Balken
+    @Published var stage = ""
     @Published var canUndo = false
     var fileName = "Dokument"
     var notes: [String] = []
@@ -988,8 +996,17 @@ struct PSDScreen: View {
                 }
             }
             if m.busy {
-                ProgressView().scaleEffect(1.4).padding(24)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                VStack(spacing: 12) {
+                    if let p = m.progress {
+                        Text(m.stage).font(.footnote)
+                        ProgressView(value: p).frame(width: 220)
+                        Text("\(Int(p * 100)) %").font(.headline.monospacedDigit())
+                    } else {
+                        ProgressView().scaleEffect(1.4)
+                    }
+                }
+                .padding(24)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
             }
             if let msg = m.message {
                 Text(msg).font(.footnote).padding(10).multilineTextAlignment(.center)
@@ -1091,6 +1108,10 @@ struct PSDScreen: View {
                 }
                 .padding(.horizontal, 24)
             }
+            Button { selfTest() } label: {
+                Label("Selbsttest (Test-PSD erzeugen & öffnen)", systemImage: "checkmark.seal").font(.footnote)
+            }
+            Text("Version \(appBuildTag)").font(.caption2).foregroundStyle(.secondary)
             Button { refreshLocal() } label: {
                 Label("Ordner aktualisieren", systemImage: "arrow.clockwise").font(.footnote)
             }
@@ -1215,21 +1236,32 @@ struct PSDScreen: View {
     private func openFile(_ url: URL) {
         let fileName = url.lastPathComponent
         m.busy = true
+        m.progress = 0
+        m.stage = "Datei wird geladen …"
         m.message = "Lade „\(fileName)“ …"
         Task {
+            let box = ProgressBox()
+            let poll = Task { @MainActor in
+                while !Task.isCancelled {
+                    m.progress = box.value * 0.5
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+            }
             let loaded: Data? = await Task.detached(priority: .userInitiated) { () -> Data? in
                 let access = url.startAccessingSecurityScopedResource()
                 defer { if access { url.stopAccessingSecurityScopedResource() } }
                 var data: Data?
                 var coordErr: NSError?
                 NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordErr) { u in
-                    data = try? Data(contentsOf: u, options: .mappedIfSafe)
+                    data = readChunked(u, box: box)
                 }
                 if data == nil { data = try? Data(contentsOf: url) }
                 return data
             }.value
+            poll.cancel()
             guard let d = loaded, !d.isEmpty else {
                 m.busy = false
+                m.progress = nil
                 m.message = "Datei „\(fileName)“ konnte nicht gelesen werden."
                 return
             }
@@ -1239,15 +1271,25 @@ struct PSDScreen: View {
 
     private func openData(_ data: Data, name: String) {
         m.busy = true
+        m.progress = 0.5
+        m.stage = "Ebenen werden gelesen …"
         let mb = String(format: "%.1f", Double(data.count) / 1_048_576)
         m.message = "„\(name)“ gelesen (\(mb) MB) – analysiere …"
         Task {
+            let poll = Task { @MainActor in
+                while !Task.isCancelled {
+                    m.progress = 0.5 + 0.5 * PSDParser.progress
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+            }
             let result: Result<PSDDocument, PSDError> = await Task.detached(priority: .userInitiated) { () -> Result<PSDDocument, PSDError> in
                 do { return .success(try PSDParser.parse(data)) }
                 catch let e as PSDError { return .failure(e) }
                 catch { return .failure(PSDError(msg: "Unbekannter Fehler beim Lesen.")) }
             }.value
+            poll.cancel()
             m.busy = false
+            m.progress = nil
             switch result {
             case .success(let doc):
                 m.open(doc, name: name)
@@ -1258,9 +1300,21 @@ struct PSDScreen: View {
         }
     }
 
+    /// Selbsttest: erzeugt eine kleine PSD in der App und öffnet sie.
+    private func selfTest() {
+        let t = PSDModel()
+        t.newDocument(width: 240, height: 160)
+        guard let u = t.psdFile(), let d = try? Data(contentsOf: u) else {
+            m.message = "Selbsttest: PSD konnte nicht erzeugt werden."
+            return
+        }
+        openData(d, name: "Selbsttest")
+    }
+
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
         guard let p = providers.first else { return false }
         m.busy = true
+        m.progress = nil
         m.message = "Ablegen erkannt – lade Datei …"
         let types = p.registeredTypeIdentifiers
         let typeID = types.first(where: { UTType($0)?.conforms(to: .data) == true }) ?? UTType.item.identifier
@@ -1604,6 +1658,30 @@ struct PSDLayersSheet: View {
     }
 }
 
+
+final class ProgressBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v = 0.0
+    var value: Double { lock.lock(); defer { lock.unlock() }; return v }
+    func set(_ x: Double) { lock.lock(); v = x; lock.unlock() }
+}
+
+/// Liest eine Datei in 8-MB-Stücken und meldet den Fortschritt.
+func readChunked(_ url: URL, box: ProgressBox) -> Data? {
+    guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
+    defer { try? fh.close() }
+    let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+    let total = max(1, (attrs?[.size] as? NSNumber)?.intValue ?? 1)
+    var out = Data()
+    out.reserveCapacity(total)
+    while true {
+        let chunk = autoreleasepool { (try? fh.read(upToCount: 8 * 1024 * 1024)) ?? nil }
+        guard let c = chunk, !c.isEmpty else { break }
+        out.append(c)
+        box.set(min(1, Double(out.count) / Double(total)))
+    }
+    return out.isEmpty ? nil : out
+}
 
 // MARK: - Dateiauswahl (zuverlässiger als fileImporter)
 
