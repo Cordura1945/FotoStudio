@@ -1216,7 +1216,7 @@ struct PSDScreen: View {
         let types = p.registeredTypeIdentifiers
         let typeID = types.first(where: { UTType($0)?.conforms(to: .data) == true }) ?? UTType.item.identifier
         p.loadFileRepresentation(forTypeIdentifier: typeID) { url, err in
-            guard let url, let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
+            guard let url, let data = try? Data(contentsOf: url) else {
                 DispatchQueue.main.async {
                     m.busy = false
                     m.message = "Ablegen fehlgeschlagen (\(typeID))."
