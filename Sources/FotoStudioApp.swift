@@ -24,7 +24,7 @@ struct FotoStudioApp: App {
 }
 
 /// Wird bei jeder Lieferung hochgezählt, damit man sieht, welche Fassung installiert ist.
-let appBuildTag = "Build 10"
+let appBuildTag = "Build 11"
 
 // MARK: - Startseite (Aufbau wie Photoshop Express)
 
