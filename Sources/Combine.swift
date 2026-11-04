@@ -657,6 +657,23 @@ final class CombineModel: ObservableObject {
         layers.append(l)
     }
 
+    func move(_ id: UUID, to targetID: UUID) {
+        guard id != targetID,
+              let from = layers.firstIndex(where: { $0.id == id }),
+              let to = layers.firstIndex(where: { $0.id == targetID }) else { return }
+        let l = layers.remove(at: from)
+        layers.insert(l, at: to)
+        assignCells(reset: false)
+    }
+
+    func step(_ id: UUID, up: Bool) {
+        guard let i = layers.firstIndex(where: { $0.id == id }) else { return }
+        let j = up ? i + 1 : i - 1
+        guard j >= 0, j < layers.count else { return }
+        layers.swapAt(i, j)
+        assignCells(reset: false)
+    }
+
     func toBack(_ id: UUID) {
         guard let i = layers.firstIndex(where: { $0.id == id }) else { return }
         let l = layers.remove(at: i)
@@ -788,6 +805,11 @@ struct CombineScreen: View {
     @State private var showSmartcut = false
     @State private var editorFor: EditorRequest?
     @State private var tmode: TMode = .free
+    @State private var zoom: CGFloat = 1
+    @State private var zoomBase: CGFloat = 1
+    @State private var pan: CGSize = .zero
+    @State private var lastT: CGSize = .zero
+    @State private var stripOpen = true
 
     var body: some View {
         ZStack {
@@ -866,11 +888,16 @@ struct CombineScreen: View {
         GeometryReader { geo in
             let cs = fitSize(CGSize(width: m.ratio, height: 1), within: CGSize(width: geo.size.width - 16, height: geo.size.height - 16))
             ZStack {
-                if m.bg.transparent { checker(cs) }
-                CanvasView(layers: m.layers, bg: m.bg, size: cs, gap: m.gap, corner: m.corner)
-                    .overlay(gestureLayer(cs))
-                    .overlay(HandlesLayer(m: m, cs: cs, mode: tab == .transform ? tmode : nil))
-                    .shadow(color: .black.opacity(0.5), radius: 8)
+                ZStack {
+                    if m.bg.transparent { checker(cs) }
+                    CanvasView(layers: m.layers, bg: m.bg, size: cs, gap: m.gap, corner: m.corner)
+                        .overlay(gestureLayer(cs))
+                        .overlay(HandlesLayer(m: m, cs: cs, mode: tab == .transform ? tmode : nil))
+                        .shadow(color: .black.opacity(0.5), radius: 8)
+                }
+                .frame(width: geo.size.width, height: geo.size.height)
+                .scaleEffect(zoom)
+                .offset(pan)
                 if m.layers.isEmpty {
                     PhotosPicker(selection: $items, maxSelectionCount: 9, matching: .images) {
                         VStack(spacing: 8) {
@@ -884,8 +911,47 @@ struct CombineScreen: View {
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
+            .clipped()
+            .simultaneousGesture(
+                MagnifyGesture()
+                    .onChanged { v in
+                        let nz = min(8, max(1, zoomBase * v.magnification))
+                        let f = nz / max(zoom, 0.01)
+                        let ax = v.startLocation.x - geo.size.width / 2
+                        let ay = v.startLocation.y - geo.size.height / 2
+                        pan = clampedPan(CGSize(width: ax - (ax - pan.width) * f,
+                                                height: ay - (ay - pan.height) * f), geo.size, nz)
+                        zoom = nz
+                    }
+                    .onEnded { _ in zoomBase = zoom }
+            )
+            .background(
+                TwoFingerPan { t, ended in
+                    if ended { lastT = .zero; return }
+                    pan = clampedPan(CGSize(width: pan.width + t.width - lastT.width,
+                                            height: pan.height + t.height - lastT.height), geo.size, zoom)
+                    lastT = t
+                }
+            )
             .overlay(alignment: .bottom) { canvasControls }
+            .overlay(alignment: .topTrailing) {
+                if zoom > 1.01 {
+                    Button { withAnimation { zoom = 1; zoomBase = 1; pan = .zero } } label: {
+                        Label("\(Int(zoom * 100)) %", systemImage: "arrow.down.right.and.arrow.up.left")
+                            .font(.caption.bold()).padding(8)
+                            .background(Color.black.opacity(0.6), in: Capsule())
+                            .foregroundStyle(.white)
+                    }
+                    .padding(8)
+                }
+            }
         }
+    }
+
+    private func clampedPan(_ p: CGSize, _ size: CGSize, _ z: CGFloat) -> CGSize {
+        let mx = size.width * (z - 1) / 2 + 40
+        let my = size.height * (z - 1) / 2 + 40
+        return CGSize(width: min(max(p.width, -mx), mx), height: min(max(p.height, -my), my))
     }
 
     private func floatBtn(_ icon: String, _ enabled: Bool, _ action: @escaping () -> Void) -> some View {
@@ -898,6 +964,26 @@ struct CombineScreen: View {
         .disabled(!enabled)
     }
 
+    private func layerThumb(_ l: CLayer) -> some View {
+        Button { m.selected = l.id } label: {
+            Image(uiImage: l.rendered).resizable().scaledToFill()
+                .frame(width: 62, height: 62)
+                .background(Color(white: 0.2))
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+                .overlay(RoundedRectangle(cornerRadius: 7)
+                    .stroke(m.selected == l.id ? Color.blue : Color.white.opacity(0.5), lineWidth: 2.5))
+                .opacity(l.visible ? 1 : 0.4)
+                .overlay(alignment: .topTrailing) {
+                    if l.locked { Image(systemName: "lock.fill").font(.system(size: 11)).padding(3) }
+                }
+        }
+        .draggable(l.id.uuidString)
+        .dropDestination(for: String.self) { items, _ in
+            if let t = items.first, let from = UUID(uuidString: t) { m.move(from, to: l.id) }
+            return true
+        }
+    }
+
     private var canvasControls: some View {
         HStack(alignment: .bottom, spacing: 8) {
             floatBtn("arrow.uturn.backward", m.canUndo) { m.undo() }
@@ -905,26 +991,35 @@ struct CombineScreen: View {
             Spacer()
             if !m.layers.isEmpty {
                 VStack(alignment: .trailing, spacing: 6) {
-                    ForEach(Array(m.layers.reversed().prefix(3))) { l in
-                        Button { m.selected = l.id } label: {
-                            Image(uiImage: l.rendered).resizable().scaledToFill()
-                                .frame(width: 38, height: 38)
-                                .background(Color(white: 0.2))
-                                .clipShape(RoundedRectangle(cornerRadius: 5))
-                                .overlay(RoundedRectangle(cornerRadius: 5)
-                                    .stroke(m.selected == l.id ? Color.blue : Color.white.opacity(0.5), lineWidth: 2))
-                                .opacity(l.visible ? 1 : 0.4)
-                                .overlay(alignment: .topTrailing) {
-                                    if l.locked { Image(systemName: "lock.fill").font(.system(size: 9)).padding(2) }
+                    VStack(spacing: 6) {
+                        Button { withAnimation { stripOpen.toggle() } } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "square.3.layers.3d")
+                                Image(systemName: stripOpen ? "chevron.down" : "chevron.up")
+                            }
+                            .font(.caption.bold())
+                            .frame(width: 66, height: 26)
+                            .foregroundStyle(.white)
+                        }
+                        if stripOpen {
+                            ScrollView(.vertical, showsIndicators: false) {
+                                VStack(spacing: 8) {
+                                    ForEach(Array(m.layers.reversed())) { l in layerThumb(l) }
                                 }
+                            }
+                            .frame(maxHeight: 250)
                         }
                     }
+                    .padding(6)
+                    .background(Color.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 14))
                     HStack(spacing: 6) {
                         Menu {
                             if let id = m.selected, let l = m.layer(id) {
                                 Button { m.update(id) { $0.visible.toggle() } } label: {
                                     Label(l.visible ? "Ausblenden" : "Anzeigen", systemImage: l.visible ? "eye.slash" : "eye")
                                 }
+                                Button { m.step(id, up: true) } label: { Label("Eine Ebene nach vorne", systemImage: "arrow.up") }
+                                Button { m.step(id, up: false) } label: { Label("Eine Ebene nach hinten", systemImage: "arrow.down") }
                                 Button { m.duplicate(id) } label: { Label("Kopieren", systemImage: "plus.square.on.square") }
                                 Button { m.toggleLock(id) } label: {
                                     Label(l.locked ? "Entsperren" : "Sperren", systemImage: l.locked ? "lock.open" : "lock")
@@ -969,16 +1064,6 @@ struct CombineScreen: View {
                         }
                     }
                     .onEnded { _ in dragStart = nil }
-            )
-            .simultaneousGesture(
-                MagnifyGesture()
-                    .onChanged { v in
-                        guard let id = m.selected, let l = m.layer(id), !l.locked else { return }
-                        if scaleStart == nil { scaleStart = l.scale }
-                        let s = scaleStart ?? 1
-                        m.update(id) { $0.scale = max(0.1, min(8, s * v.magnification)) }
-                    }
-                    .onEnded { _ in scaleStart = nil }
             )
             .simultaneousGesture(
                 RotateGesture()
