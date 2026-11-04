@@ -1,6 +1,7 @@
 import SwiftUI
 import PhotosUI
 import CoreImage
+import Vision
 
 // MARK: - Retusche-Werkzeuge
 
@@ -38,7 +39,7 @@ enum RetouchMode: String, CaseIterable, Identifiable {
 }
 
 enum FixTool: String, CaseIterable, Identifiable {
-    case remove, patch, clone, object, more
+    case remove, patch, clone, object, smart, more
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -46,6 +47,7 @@ enum FixTool: String, CaseIterable, Identifiable {
         case .patch: return "Ausbessern"
         case .clone: return "Klonen"
         case .object: return "Objekte entfernen"
+        case .smart: return "Smart-Füllung"
         case .more: return "Mehr"
         }
     }
@@ -78,6 +80,7 @@ final class EditorModel: ObservableObject {
     @Published var canRedo = false
     @Published var fixTool: FixTool = .remove
     @Published var sizePreview = false
+    @Published var busy = false
     @Published var patchPts: [CGPoint] = []
     @Published var tOff: CGPoint = .zero      // Ziel-Blase: Verschiebung
     @Published var tScale = 1.0
@@ -286,7 +289,7 @@ final class EditorModel: ObservableObject {
             }
         }
         guard var m = CIImage(image: img) else { return nil }
-        let hd = fixTool == .remove ? 0.7 : hardness
+        let hd = fixTool == .remove ? 0.7 : (fixTool == .smart ? 1.0 : hardness)
         let soft = (1 - hd) * Double(radius) * 0.5
         if soft > 0.5 {
             let e = m.extent
@@ -301,6 +304,10 @@ final class EditorModel: ObservableObject {
         let radius = CGFloat(brushSize) * min(e.width, e.height)
         guard let mask = makeMask(pts, radius: radius, size: e.size) else { return }
         let r = Double(radius)
+        if fixTool == .smart {
+            runSmartFill(mask: mask, bbox: boxRect(pts).insetBy(dx: -radius, dy: -radius))
+            return
+        }
 
         let effect: CIImage
         switch mode {
@@ -339,6 +346,98 @@ final class EditorModel: ObservableObject {
             kCIInputMaskImageKey: blendMask
         ]).cropped(to: e)
         bake(out)
+    }
+
+    // MARK: Smart-Füllung (Muster-basiertes Auffüllen)
+
+    private func runSmartFill(mask: CIImage, bbox: CGRect) {
+        guard let b = base, !busy else { return }
+        let e = b.extent
+        let H = e.height
+        let margin = max(40, 0.8 * max(bbox.width, bbox.height))
+        let crop = bbox.insetBy(dx: -margin, dy: -margin)
+            .intersection(CGRect(origin: .zero, size: e.size)).integral
+        guard crop.width > 8, crop.height > 8 else { return }
+        let sc = min(1, 440 / max(crop.width, crop.height))
+        let w = max(8, Int((crop.width * sc).rounded()))
+        let h = max(8, Int((crop.height * sc).rounded()))
+        let ciRect = CGRect(x: crop.minX, y: H - crop.maxY, width: crop.width, height: crop.height)
+        let srgb = CGColorSpace(name: CGColorSpace.sRGB)
+
+        func bytes(_ img: CIImage) -> [UInt8] {
+            let t = img.cropped(to: ciRect)
+                .transformed(by: CGAffineTransform(translationX: -ciRect.minX, y: -ciRect.minY))
+                .transformed(by: CGAffineTransform(scaleX: CGFloat(w) / crop.width, y: CGFloat(h) / crop.height))
+            var out = [UInt8](repeating: 0, count: w * h * 4)
+            sharedCI.render(t, toBitmap: &out, rowBytes: w * 4,
+                            bounds: CGRect(x: 0, y: 0, width: w, height: h),
+                            format: .RGBA8, colorSpace: srgb)
+            return out
+        }
+        let black = CIImage(color: CIColor.black).cropped(to: e)
+        let px = bytes(b)
+        let mk = bytes(mask.composited(over: black))
+
+        busy = true
+        Task { [weak self] in
+            let res: [UInt8]? = await Task.detached(priority: .userInitiated) {
+                Inpainter.fill(rgba: px, mask: mk, w: w, h: h, dilate: 2)
+            }.value
+            guard let self else { return }
+            self.busy = false
+            guard let res, let prov = CGDataProvider(data: Data(res) as CFData),
+                  let cg = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
+                                   space: srgb ?? CGColorSpaceCreateDeviceRGB(),
+                                   bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                                   provider: prov, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+            else { self.message = "Zu wenig Umgebung – Bereich verkleinern"; return }
+            guard let b2 = self.base else { return }
+            let fi = CIImage(cgImage: cg)
+                .transformed(by: CGAffineTransform(scaleX: crop.width / CGFloat(w), y: crop.height / CGFloat(h)))
+                .transformed(by: CGAffineTransform(translationX: ciRect.minX, y: ciRect.minY))
+            let grow = max(2, 2 / sc)
+            var m2 = ci("CIMorphologyMaximum", mask.clampedToExtent(), ["inputRadius": grow]).cropped(to: e)
+            m2 = blurred(m2.clampedToExtent(), 1.5).cropped(to: e)
+            self.pushUndo()
+            self.bake(fi.applyingFilter("CIBlendWithAlphaMask", parameters: [
+                kCIInputBackgroundImageKey: b2, kCIInputMaskImageKey: m2
+            ]).cropped(to: e))
+        }
+    }
+
+    /// Findet automatisch allen Text im Bild und füllt ihn mit dem Hintergrund.
+    func smartRemoveText() {
+        guard let b = base, !busy, let cg = sharedCI.createCGImage(b, from: b.extent) else { return }
+        let e = b.extent
+        busy = true
+        Task { [weak self] in
+            let boxes: [CGRect] = await Task.detached(priority: .userInitiated) { () -> [CGRect] in
+                let req = VNRecognizeTextRequest()
+                req.recognitionLevel = .accurate
+                req.usesLanguageCorrection = false
+                let hdl = VNImageRequestHandler(cgImage: cg, options: [:])
+                do { try hdl.perform([req]) } catch { return [] }
+                return (req.results ?? []).map { $0.boundingBox }
+            }.value
+            guard let self else { return }
+            self.busy = false
+            if boxes.isEmpty { self.message = "Kein Text gefunden"; return }
+            let rects = boxes.map {
+                CGRect(x: $0.minX * e.width, y: (1 - $0.maxY) * e.height,
+                       width: $0.width * e.width, height: $0.height * e.height).insetBy(dx: -6, dy: -6)
+            }
+            let fmt = UIGraphicsImageRendererFormat()
+            fmt.scale = 1
+            fmt.opaque = false
+            let img = UIGraphicsImageRenderer(size: e.size, format: fmt).image { rc in
+                rc.cgContext.setFillColor(UIColor.white.cgColor)
+                for r in rects { rc.cgContext.fill(r) }
+            }
+            guard let m = CIImage(image: img) else { return }
+            var u = rects[0]
+            for r in rects { u = u.union(r) }
+            self.runSmartFill(mask: m, bbox: u)
+        }
     }
 
     // Mehrstufige Füllung: Umgebung "diffundiert" in die Lücke
@@ -550,6 +649,7 @@ struct EditorScreen: View {
     @State private var pan: CGSize = .zero
     @State private var panBase: CGSize = .zero
     @State private var hand = false
+    @State private var lastT: CGSize = .zero
     @Environment(\.dismiss) private var dismiss
 
     init(startImage: UIImage? = nil, onFinish: ((UIImage) -> Void)? = nil, startTab: EditorTab = .adjust) {
@@ -691,6 +791,10 @@ struct EditorScreen: View {
                             )
                             .onTapGesture(count: 2) { withAnimation { zoom = 1; zoomBase = 1; pan = .zero; panBase = .zero } }
                     }
+                    if m.busy {
+                        ProgressView("Fülle Hintergrund …").tint(.white).padding(18)
+                            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                    }
                     HStack(spacing: 8) {
                         floatButton("arrow.uturn.backward", enabled: m.canUndo || !m.patchPts.isEmpty) { m.undo() }
                         floatButton("arrow.uturn.forward", enabled: m.canRedo) { m.redo() }
@@ -714,10 +818,23 @@ struct EditorScreen: View {
                 .simultaneousGesture(
                     MagnifyGesture()
                         .onChanged { v in
-                            zoom = min(8, max(1, zoomBase * v.magnification))
-                            pan = clampedPan(pan, geo.size, zoom)
+                            let nz = min(8, max(1, zoomBase * v.magnification))
+                            let f = nz / max(zoom, 0.01)
+                            let ax = v.startLocation.x - geo.size.width / 2
+                            let ay = v.startLocation.y - geo.size.height / 2
+                            pan = clampedPan(CGSize(width: ax - (ax - pan.width) * f,
+                                                    height: ay - (ay - pan.height) * f), geo.size, nz)
+                            zoom = nz
                         }
                         .onEnded { _ in zoomBase = zoom; panBase = pan }
+                )
+                .background(
+                    TwoFingerPan { t, ended in
+                        if ended { lastT = .zero; panBase = pan; return }
+                        pan = clampedPan(CGSize(width: pan.width + t.width - lastT.width,
+                                                height: pan.height + t.height - lastT.height), geo.size, zoom)
+                        lastT = t
+                    }
                 )
             }
         }
@@ -771,7 +888,7 @@ struct RetouchLayer: View {
 
     private var scale: CGFloat { rect.width / max(imgSize.width, 1) }
     private var overlayColor: Color {
-        (m.fixTool == .remove || m.fixTool == .object) ? Color.red.opacity(0.5) : Color.white.opacity(0.45)
+        (m.fixTool == .remove || m.fixTool == .object || m.fixTool == .smart) ? Color.red.opacity(0.5) : Color.white.opacity(0.45)
     }
     private var lineW: CGFloat { m.fixTool == .object ? 4 : diameter }
     private var diameter: CGFloat { CGFloat(m.brushSize) * min(imgSize.width, imgSize.height) * scale * 2 }
@@ -1087,7 +1204,7 @@ struct FixPanel: View {
     @State private var opt: FixOpt = .size
     @State private var editing = false
 
-    private var brushTool: Bool { m.fixTool == .remove || m.fixTool == .clone || m.fixTool == .more }
+    private var brushTool: Bool { m.fixTool == .remove || m.fixTool == .clone || m.fixTool == .more || m.fixTool == .smart }
 
     private var sliderBinding: Binding<Double> {
         switch (m.fixTool, opt) {
@@ -1167,6 +1284,19 @@ struct FixPanel: View {
             VStack(spacing: 10) {
                 Image(systemName: "lasso.badge.sparkles").font(.title)
                 hint("Umkreise das Objekt, es wird aus der Umgebung ersetzt.")
+            }
+        case .smart:
+            VStack(spacing: 8) {
+                optionRow([(.size, "Größe", "circle.dashed")])
+                Button { m.smartRemoveText() } label: {
+                    Label("Text automatisch entfernen", systemImage: "textformat")
+                        .font(.footnote.bold())
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .background(Color.blue, in: Capsule())
+                        .foregroundStyle(.white)
+                }
+                .disabled(m.busy)
+                hint("Oder male über Schrift/Objekte: Der Hintergrund wird aus passenden Bildstellen nachgebaut.")
             }
         case .clone:
             VStack(spacing: 8) {
@@ -1269,5 +1399,221 @@ struct CutoutPanel: View {
                 .font(.caption2).foregroundStyle(.secondary).padding(.horizontal)
         }
         .padding(.top, 14)
+    }
+}
+
+
+// MARK: - Zwei-Finger-Wischen (zum Verschieben beim Zoomen)
+
+struct TwoFingerPan: UIViewRepresentable {
+    var onChange: (CGSize, Bool) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> PanHostView {
+        let v = PanHostView()
+        v.isUserInteractionEnabled = false
+        v.coord = context.coordinator
+        context.coordinator.onChange = onChange
+        return v
+    }
+
+    func updateUIView(_ uiView: PanHostView, context: Context) {
+        context.coordinator.onChange = onChange
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var onChange: (CGSize, Bool) -> Void = { _, _ in }
+        weak var host: UIView?
+        private var active = false
+
+        @objc func handle(_ g: UIPanGestureRecognizer) {
+            guard let h = host else { return }
+            switch g.state {
+            case .began:
+                active = h.bounds.contains(g.location(in: h))
+            case .changed:
+                if active {
+                    let t = g.translation(in: h)
+                    onChange(CGSize(width: t.x, height: t.y), false)
+                }
+            case .ended, .cancelled, .failed:
+                if active { onChange(.zero, true) }
+                active = false
+            default: break
+            }
+        }
+
+        func gestureRecognizer(_ g: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+    }
+}
+
+final class PanHostView: UIView {
+    var coord: TwoFingerPan.Coordinator?
+    private var pan: UIPanGestureRecognizer?
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if let p = pan { p.view?.removeGestureRecognizer(p); pan = nil }
+        guard let w = window, let c = coord else { return }
+        let p = UIPanGestureRecognizer(target: c, action: #selector(TwoFingerPan.Coordinator.handle(_:)))
+        p.minimumNumberOfTouches = 2
+        p.maximumNumberOfTouches = 2
+        p.cancelsTouchesInView = false
+        p.delegate = c
+        c.host = self
+        w.addGestureRecognizer(p)
+        pan = p
+    }
+}
+
+
+// MARK: - Muster-basiertes Auffüllen (PatchMatch-artig, zeilenweise von außen nach innen)
+
+enum Inpainter {
+    static func fill(rgba: [UInt8], mask: [UInt8], w: Int, h: Int, dilate: Int, radius r: Int = 4) -> [UInt8]? {
+        let n = w * h
+        guard rgba.count >= n * 4, mask.count >= n * 4, w > 2 * r + 2, h > 2 * r + 2 else { return nil }
+
+        var unknown = [Bool](repeating: false, count: n)
+        for i in 0..<n where mask[i * 4] > 100 { unknown[i] = true }
+        for _ in 0..<max(0, dilate) {
+            var nu = unknown
+            for y in 0..<h {
+                for x in 0..<w where !unknown[y * w + x] {
+                    let i = y * w + x
+                    if (x > 0 && unknown[i - 1]) || (x < w - 1 && unknown[i + 1]) ||
+                        (y > 0 && unknown[i - w]) || (y < h - 1 && unknown[i + w]) { nu[i] = true }
+                }
+            }
+            unknown = nu
+        }
+        var remaining = 0
+        for u in unknown where u { remaining += 1 }
+        if remaining == 0 { return rgba }
+
+        // gültige Quellpositionen: Patch komplett im bekannten Bereich
+        let iw = w + 1
+        var integ = [Int32](repeating: 0, count: iw * (h + 1))
+        for y in 0..<h {
+            var row: Int32 = 0
+            for x in 0..<w {
+                row += unknown[y * w + x] ? 1 : 0
+                integ[(y + 1) * iw + x + 1] = integ[y * iw + x + 1] + row
+            }
+        }
+        func unk(_ x0: Int, _ y0: Int, _ x1: Int, _ y1: Int) -> Int32 {
+            integ[(y1 + 1) * iw + x1 + 1] - integ[y0 * iw + x1 + 1] - integ[(y1 + 1) * iw + x0] + integ[y0 * iw + x0]
+        }
+        var sources: [Int32] = []
+        let V = UnsafeMutablePointer<UInt8>.allocate(capacity: n)
+        V.initialize(repeating: 0, count: n)
+        defer { V.deallocate() }
+        for y in r..<(h - r) {
+            for x in r..<(w - r) where unk(x - r, y - r, x + r, y + r) == 0 {
+                sources.append(Int32(y * w + x))
+                V[y * w + x] = 1
+            }
+        }
+        if sources.isEmpty { return nil }
+
+        let P = UnsafeMutablePointer<UInt8>.allocate(capacity: n * 4)
+        P.initialize(from: rgba, count: n * 4)
+        let K = UnsafeMutablePointer<UInt8>.allocate(capacity: n)
+        let S = UnsafeMutablePointer<Int32>.allocate(capacity: n)
+        S.initialize(repeating: -1, count: n)
+        defer { P.deallocate(); K.deallocate(); S.deallocate() }
+        for i in 0..<n { K[i] = unknown[i] ? 0 : 1 }
+
+        func cost(_ px: Int, _ py: Int, _ q: Int) -> Float {
+            let qx = q % w, qy = q / w
+            var s: Float = 0
+            var c: Float = 0
+            for dy in -r...r {
+                let y2 = py + dy
+                if y2 < 0 || y2 >= h { continue }
+                for dx in -r...r {
+                    let x2 = px + dx
+                    if x2 < 0 || x2 >= w { continue }
+                    let pi = y2 * w + x2
+                    if K[pi] == 0 { continue }
+                    let qi = (qy + dy) * w + qx + dx
+                    let a = Float(P[pi * 4]) - Float(P[qi * 4])
+                    let b = Float(P[pi * 4 + 1]) - Float(P[qi * 4 + 1])
+                    let d = Float(P[pi * 4 + 2]) - Float(P[qi * 4 + 2])
+                    s += a * a + b * b + d * d
+                    c += 1
+                }
+            }
+            return c > 0 ? s / c : Float.infinity
+        }
+
+        var rng: UInt64 = 88172645463325252
+        func rnd() -> UInt64 {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17
+            return rng
+        }
+
+        let nSrc = UInt64(sources.count)
+        while remaining > 0 {
+            var ring: [Int] = []
+            for y in 0..<h {
+                for x in 0..<w {
+                    let i = y * w + x
+                    if K[i] != 0 { continue }
+                    if (x > 0 && K[i - 1] != 0) || (x < w - 1 && K[i + 1] != 0) ||
+                        (y > 0 && K[i - w] != 0) || (y < h - 1 && K[i + w] != 0) { ring.append(i) }
+                }
+            }
+            if ring.isEmpty { break }
+            var chosen = [Int32](repeating: -1, count: ring.count)
+            for (k, i) in ring.enumerated() {
+                let x = i % w, y = i / w
+                var best = Float.infinity
+                var bq: Int32 = -1
+                // Fortsetzung der Nachbar-Zuordnungen (erhält Strukturen)
+                for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let nx = x + dx, ny = y + dy
+                    if nx < 0 || ny < 0 || nx >= w || ny >= h { continue }
+                    let s = S[ny * w + nx]
+                    if s < 0 { continue }
+                    let sx = Int(s) % w - dx, sy = Int(s) / w - dy
+                    if sx < 0 || sy < 0 || sx >= w || sy >= h { continue }
+                    let q = sy * w + sx
+                    if V[q] == 0 { continue }
+                    let c = cost(x, y, q)
+                    if c < best { best = c; bq = Int32(q) }
+                }
+                // zufällige Kandidaten, global und lokal
+                for _ in 0..<60 {
+                    let q = Int(sources[Int(rnd() % nSrc)])
+                    let c = cost(x, y, q)
+                    if c < best { best = c; bq = Int32(q) }
+                }
+                for _ in 0..<40 {
+                    let qx = x + Int(rnd() % 81) - 40
+                    let qy = y + Int(rnd() % 81) - 40
+                    if qx < 0 || qy < 0 || qx >= w || qy >= h { continue }
+                    let q = qy * w + qx
+                    if V[q] == 0 { continue }
+                    let c = cost(x, y, q)
+                    if c < best { best = c; bq = Int32(q) }
+                }
+                chosen[k] = bq
+            }
+            for (k, i) in ring.enumerated() {
+                var q = Int(chosen[k])
+                if q < 0 { q = Int(sources[0]) }
+                P[i * 4] = P[q * 4]
+                P[i * 4 + 1] = P[q * 4 + 1]
+                P[i * 4 + 2] = P[q * 4 + 2]
+                P[i * 4 + 3] = P[q * 4 + 3]
+                S[i] = Int32(q)
+            }
+            for i in ring { K[i] = 1 }
+            remaining -= ring.count
+        }
+        return Array(UnsafeBufferPointer(start: P, count: n * 4))
     }
 }
