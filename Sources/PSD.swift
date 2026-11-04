@@ -292,6 +292,18 @@ enum PSDParser {
         return UIImage(cgImage: cg)
     }
 
+    static func scaled(_ img: UIImage, _ s: CGFloat) -> UIImage {
+        guard s < 1, let cg = img.cgImage else { return img }
+        let w = max(1, Int((CGFloat(cg.width) * s).rounded()))
+        let h = max(1, Int((CGFloat(cg.height) * s).rounded()))
+        let fmt = UIGraphicsImageRendererFormat()
+        fmt.scale = 1
+        fmt.opaque = false
+        return UIGraphicsImageRenderer(size: CGSize(width: w, height: h), format: fmt).image { _ in
+            UIImage(cgImage: cg).draw(in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+    }
+
     static func parse(_ data: Data) throws -> PSDDocument {
         let bytes = [UInt8](data)
         var r = ByteReader(bytes)
@@ -307,6 +319,8 @@ enum PSDParser {
         guard depth == 8 || depth == 16 else { throw PSDError(msg: "Nur 8- und 16-Bit-Dateien werden unterstützt.") }
         guard mode == 3 || mode == 1 else { throw PSDError(msg: "Nur RGB- und Graustufen-Dateien werden unterstützt (kein CMYK).") }
         guard width > 0, height > 0, width <= 30000, height <= 30000 else { throw PSDError(msg: "Ungültige Größe.") }
+        // Große Dokumente werden zum Bearbeiten verkleinert (sonst geht der Speicher aus)
+        let sc: CGFloat = min(1, 3000 / CGFloat(max(width, height)))
 
         try r.skip(try r.u32())     // Farbmodus-Daten
         try r.skip(try r.u32())     // Bildressourcen
@@ -402,7 +416,7 @@ enum PSDParser {
                     pl.opacity = Double(rec.opacity) / 255
                     pl.blendKey = rec.blendKey
                     pl.visible = (rec.flags & 2) == 0
-                    pl.origin = CGPoint(x: rec.left, y: rec.top)
+                    pl.origin = CGPoint(x: CGFloat(rec.left) * sc, y: CGFloat(rec.top) * sc)
                     switch rec.section {
                     case 1, 2: pl.kind = .groupStart
                     case 3: pl.kind = .groupEnd; pl.name = "Ende der Gruppe"
@@ -415,6 +429,7 @@ enum PSDParser {
                             else if let rr = planes[0], let gg = planes[1], let bb = planes[2] { rgb = [rr, gg, bb] }
                             else { rgb = [] }
                             pl.image = makeImage(rgb: rgb, alpha: planes[-1], w: w, h: h, rec: rec, maskPlane: planes[-2])
+                            if sc < 1, let im = pl.image { pl.image = scaled(im, sc) }
                         }
                         if pl.image == nil {
                             skippedAdjustments += 1
@@ -457,6 +472,7 @@ enum PSDParser {
                         let cnt = (Int(bytes[tp]) << 8) | Int(bytes[tp + 1])
                         tp += 2
                         let end = min(dp + cnt, bytes.count)
+                        guard dp <= end else { break }
                         raw.append(contentsOf: unpackBits(bytes[dp..<end], expected: rowBytes))
                         dp = end
                     }
@@ -472,14 +488,18 @@ enum PSDParser {
                 let alpha: [UInt8]? = (mode == 3 && planes.count >= 4) ? planes[3] : nil
                 var bg = PLayer(name: "Hintergrund")
                 bg.image = makeImage(rgb: rgb, alpha: alpha, w: width, h: height, rec: rec, maskPlane: nil)
+                if sc < 1, let im = bg.image { bg.image = scaled(im, sc) }
                 layers = [bg]
                 notes.append("Diese Datei enthält keine einzelnen Ebenen – nur das zusammengefügte Bild.")
             } else {
                 throw PSDError(msg: "Das Bild in der Datei konnte nicht gelesen werden.")
             }
         }
+        if sc < 1 {
+            notes.append("Große Datei (\(width) × \(height)): zum Bearbeiten auf \(Int(CGFloat(width) * sc)) × \(Int(CGFloat(height) * sc)) verkleinert.")
+        }
         notes.append("Ebenenstile/-effekte, Schnittmasken und Einstellungsebenen werden nicht dargestellt.")
-        return PSDDocument(canvas: CGSize(width: width, height: height), layers: layers, notes: notes)
+        return PSDDocument(canvas: CGSize(width: (CGFloat(width) * sc).rounded(), height: (CGFloat(height) * sc).rounded()), layers: layers, notes: notes)
     }
 }
 
@@ -936,6 +956,7 @@ struct ActivityView: UIViewControllerRepresentable {
 struct PSDScreen: View {
     @StateObject private var m = PSDModel()
     @State private var showImporter = false
+    @State private var dropping = false
     @State private var tab: PTab = .move
     @State private var showLayers = false
     @State private var photoItems: [PhotosPickerItem] = []
@@ -991,13 +1012,22 @@ struct PSDScreen: View {
                 }
             }
         }
-        .fileImporter(isPresented: $showImporter, allowedContentTypes: [UTType(filenameExtension: "psd") ?? .data, .data]) { result in
-            if case .success(let url) = result { openFile(url) }
+        .sheet(isPresented: $showImporter) {
+            DocumentPicker { url in openFile(url) }
+        }
+        .onDrop(of: [UTType.item], isTargeted: $dropping) { providers in handleDrop(providers) }
+        .overlay {
+            if dropping {
+                RoundedRectangle(cornerRadius: 16).strokeBorder(Color.blue, style: StrokeStyle(lineWidth: 4, dash: [10, 6]))
+                    .background(Color.blue.opacity(0.12))
+                    .overlay(Text("PSD oder Bild hier ablegen").font(.headline))
+                    .padding(8).allowsHitTesting(false)
+            }
         }
         .onChange(of: photoItems) { _, items in loadPhotos(items) }
         .task(id: m.message) {
             if m.message != nil {
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                try? await Task.sleep(nanoseconds: 8_000_000_000)
                 m.message = nil
             }
         }
@@ -1134,11 +1164,34 @@ struct PSDScreen: View {
     // MARK: Dateien
 
     private func openFile(_ url: URL) {
-        let access = url.startAccessingSecurityScopedResource()
-        defer { if access { url.stopAccessingSecurityScopedResource() } }
-        guard let data = try? Data(contentsOf: url) else { m.message = "Datei konnte nicht gelesen werden."; return }
-        let name = url.deletingPathExtension().lastPathComponent
+        let fileName = url.lastPathComponent
         m.busy = true
+        m.message = "Lade „\(fileName)“ …"
+        Task {
+            let loaded: Data? = await Task.detached(priority: .userInitiated) { () -> Data? in
+                let access = url.startAccessingSecurityScopedResource()
+                defer { if access { url.stopAccessingSecurityScopedResource() } }
+                var data: Data?
+                var coordErr: NSError?
+                NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordErr) { u in
+                    data = try? Data(contentsOf: u, options: .mappedIfSafe)
+                }
+                if data == nil { data = try? Data(contentsOf: url) }
+                return data
+            }.value
+            guard let d = loaded, !d.isEmpty else {
+                m.busy = false
+                m.message = "Datei „\(fileName)“ konnte nicht gelesen werden."
+                return
+            }
+            openData(d, name: url.deletingPathExtension().lastPathComponent)
+        }
+    }
+
+    private func openData(_ data: Data, name: String) {
+        m.busy = true
+        let mb = String(format: "%.1f", Double(data.count) / 1_048_576)
+        m.message = "„\(name)“ gelesen (\(mb) MB) – analysiere …"
         Task {
             let result: Result<PSDDocument, PSDError> = await Task.detached(priority: .userInitiated) { () -> Result<PSDDocument, PSDError> in
                 do { return .success(try PSDParser.parse(data)) }
@@ -1149,11 +1202,41 @@ struct PSDScreen: View {
             switch result {
             case .success(let doc):
                 m.open(doc, name: name)
-                m.message = doc.notes.joined(separator: "\n")
+                m.message = doc.notes.isEmpty ? "„\(name)“ geöffnet" : doc.notes.joined(separator: "\n")
             case .failure(let e):
-                m.message = e.msg
+                m.message = "Fehler: " + e.msg
             }
         }
+    }
+
+    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard let p = providers.first else { return false }
+        m.busy = true
+        m.message = "Ablegen erkannt – lade Datei …"
+        let types = p.registeredTypeIdentifiers
+        let typeID = types.first(where: { UTType($0)?.conforms(to: .data) == true }) ?? UTType.item.identifier
+        p.loadFileRepresentation(forTypeIdentifier: typeID) { url, err in
+            guard let url, let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
+                DispatchQueue.main.async {
+                    m.busy = false
+                    m.message = "Ablegen fehlgeschlagen (\(typeID))."
+                }
+                return
+            }
+            let name = url.deletingPathExtension().lastPathComponent
+            DispatchQueue.main.async {
+                if data.prefix(4) == Data("8BPS".utf8) {
+                    openData(data, name: name)
+                } else if let img = preparedImage(from: data, maxSide: 4096) {
+                    m.busy = false
+                    if m.hasDoc { m.addImage(img, name: name) } else { m.message = "Öffne zuerst eine PSD-Datei oder lege ein neues Dokument an." }
+                } else {
+                    m.busy = false
+                    m.message = "Dieses Dateiformat wird nicht unterstützt."
+                }
+            }
+        }
+        return true
     }
 
     private func loadPhotos(_ items: [PhotosPickerItem]) {
@@ -1468,6 +1551,32 @@ struct PSDLayersSheet: View {
             Image(systemName: "folder").frame(width: 44, height: 44)
         case .groupEnd:
             Image(systemName: "arrow.turn.down.right").frame(width: 44, height: 44).foregroundStyle(.secondary)
+        }
+    }
+}
+
+
+// MARK: - Dateiauswahl (zuverlässiger als fileImporter)
+
+struct DocumentPicker: UIViewControllerRepresentable {
+    let onPick: (URL) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(onPick) }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let p = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: false)
+        p.allowsMultipleSelection = false
+        p.delegate = context.coordinator
+        return p
+    }
+
+    func updateUIViewController(_ vc: UIDocumentPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onPick: (URL) -> Void
+        init(_ f: @escaping (URL) -> Void) { onPick = f }
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            if let u = urls.first { onPick(u) }
         }
     }
 }
