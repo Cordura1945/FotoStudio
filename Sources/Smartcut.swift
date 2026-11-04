@@ -171,6 +171,72 @@ final class CutoutEngine: ObservableObject {
         return true
     }
 
+    // MARK: Zauberstab (Fallback, wenn Vision nichts erkennt)
+
+    /// Wählt den zusammenhängenden Bereich ähnlicher Farbe unter dem Finger.
+    @discardableResult
+    func wandTap(at p: CGPoint, add: Bool, tolerance: Double) -> Bool {
+        guard let cg = source.cgImage else { return false }
+        let sc = min(1, 420 / max(extent.width, extent.height))
+        let w = Int((extent.width * sc).rounded())
+        let h = Int((extent.height * sc).rounded())
+        guard w > 2, h > 2 else { return false }
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        let ok: Bool = px.withUnsafeMutableBytes { raw in
+            guard let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8,
+                                      bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard ok else { return false }
+        let sx = min(max(Int(p.x * sc), 0), w - 1)
+        let sy = min(max(Int(p.y * sc), 0), h - 1)
+        // Startfarbe: Mittel über 3x3
+        var acc = [Int](repeating: 0, count: 3)
+        var n = 0
+        for dy in -1...1 { for dx in -1...1 {
+            let x = sx + dx, y = sy + dy
+            guard x >= 0, y >= 0, x < w, y < h else { continue }
+            let o = (y * w + x) * 4
+            acc[0] += Int(px[o]); acc[1] += Int(px[o + 1]); acc[2] += Int(px[o + 2]); n += 1
+        } }
+        let seed = acc.map { $0 / max(n, 1) }
+        let tol = Int(tolerance)
+        var mask = [UInt8](repeating: 0, count: w * h)
+        var stack = [(sx, sy)]
+        mask[sy * w + sx] = 255
+        var count = 0
+        while let (x, y) = stack.popLast() {
+            count += 1
+            for (nx, ny) in [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)] {
+                guard nx >= 0, ny >= 0, nx < w, ny < h, mask[ny * w + nx] == 0 else { continue }
+                let o = (ny * w + nx) * 4
+                let d = max(abs(Int(px[o]) - seed[0]), abs(Int(px[o + 1]) - seed[1]), abs(Int(px[o + 2]) - seed[2]))
+                if d <= tol {
+                    mask[ny * w + nx] = 255
+                    stack.append((nx, ny))
+                }
+            }
+        }
+        guard count > 3 else { return false }
+        let data = Data(mask)
+        guard let prov = CGDataProvider(data: data as CFData),
+              let mcg = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 8, bytesPerRow: w,
+                                space: CGColorSpaceCreateDeviceGray(),
+                                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                                provider: prov, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+        else { return false }
+        var m = CIImage(cgImage: mcg)
+            .transformed(by: CGAffineTransform(scaleX: extent.width / CGFloat(w), y: extent.height / CGFloat(h)))
+        m = blurred(m.clampedToExtent(), 1.5).cropped(to: extent)
+        pushUndo()
+        strokes.append((m, add))
+        baseMask = bake(applyOne(m, add: add, to: baseMask).cropped(to: extent))
+        renderPreview()
+        return true
+    }
+
     // MARK: Pinsel
 
     func paint(points: [CGPoint], radius: CGFloat, hardness: Double, add: Bool) {
@@ -252,6 +318,8 @@ final class CutoutEngine: ObservableObject {
                 f.setValue(1.0, forKey: "inputSharpness")
                 if let o = f.outputImage { bg = o.cropped(to: extent) }
             }
+            // Das Originalbild bleibt als blasser Hintergrund sichtbar
+            bg = mix(bg, srcImage, 0.3)
             out = cut.composited(over: bg)
         }
         if let cg = sharedCI.createCGImage(out, from: extent) { preview = UIImage(cgImage: cg) }
@@ -273,6 +341,7 @@ struct SmartcutView: View {
 
     @State private var tab = 0          // 0 Hinzufügen, 1 Entfernen, 2 Verfeinern
     @State private var tool = 0         // 0 Smartcut, 1 Pinsel
+    @State private var tol = 40.0
     @State private var brush = 0.06
     @State private var hardness = 0.6
     @State private var pts: [CGPoint] = []
@@ -368,8 +437,10 @@ struct SmartcutView: View {
         guard tab != 2 else { return }
         if tool == 0 {
             let p = toImage(loc, rect: rect, scale: scale, size: imgSize)
-            if !e.smartTap(at: p, add: tab == 0) {
-                note = e.detected == 0 ? "Kein Objekt erkannt – nutze den Pinsel" : "Dort wurde kein Objekt erkannt"
+            if e.detected == 0 || !e.smartTap(at: p, add: tab == 0) {
+                if !e.wandTap(at: p, add: tab == 0, tolerance: tol) {
+                    note = "Dort wurde nichts erkannt – nutze den Pinsel"
+                }
             }
         } else {
             let ip = pts.map { toImage($0, rect: rect, scale: scale, size: imgSize) }
@@ -404,8 +475,11 @@ struct SmartcutView: View {
                     HStack { Text("Härte").frame(width: 70, alignment: .leading); Slider(value: $hardness, in: 0...1) }
                         .padding(.horizontal)
                 } else {
-                    Text(tab == 0 ? "Tippe auf ein Objekt, um es zum Ausschnitt hinzuzufügen."
-                                  : "Tippe auf ein Objekt, um es aus dem Ausschnitt zu entfernen.")
+                    HStack { Text("Toleranz").frame(width: 70, alignment: .leading); Slider(value: $tol, in: 5...120) }
+                        .padding(.horizontal)
+                    Text((tab == 0 ? "Tippe auf ein Objekt oder einen Bereich, um ihn zum Ausschnitt hinzuzufügen."
+                                   : "Tippe auf ein Objekt oder einen Bereich, um ihn zu entfernen.")
+                         + (e.detected == 0 ? " Kein Motiv erkannt – es wird nach Farbe ausgewählt." : ""))
                         .font(.footnote).foregroundStyle(.secondary).padding(.horizontal)
                 }
             }
