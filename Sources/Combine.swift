@@ -383,6 +383,10 @@ struct CLayer: Identifiable {
     var blend: BlendChoice = .normal
     var flipH = false
     var visible = true
+    var locked = false
+    var stretch = CGSize(width: 1, height: 1)
+    var quad = [CGPoint](repeating: .zero, count: 4)   // Eckversatz (Anteil der Ebenengröße)
+    var shown: UIImage?                                 // verzerrte Darstellung (2x Fläche, mittig)
     var cell: CGRect?
 
     init(name: String, image: UIImage) {
@@ -433,8 +437,9 @@ struct CanvasView: View {
                 .position(x: r.midX, y: r.midY)
         } else {
             let fit = fitSize(l.rendered.size, within: CGSize(width: W * 0.6, height: H * 0.6))
-            Image(uiImage: l.rendered).resizable()
-                .frame(width: max(fit.width, 1), height: max(fit.height, 1))
+            let p: CGFloat = l.shown == nil ? 1 : 2
+            Image(uiImage: l.shown ?? l.rendered).resizable()
+                .frame(width: max(fit.width * p * l.stretch.width, 1), height: max(fit.height * p * l.stretch.height, 1))
                 .scaleEffect(x: sx, y: l.scale)
                 .rotationEffect(l.rotation)
                 .offset(x: l.offset.width * W, y: l.offset.height * W)
@@ -449,14 +454,115 @@ struct CanvasView: View {
 
 @MainActor
 final class CombineModel: ObservableObject {
-    @Published var layers: [CLayer] = []
+    @Published var layers: [CLayer] = [] { didSet { touched() } }
     @Published var selected: UUID?
-    @Published var ratio: CGFloat = 1
-    @Published var aspectName = "Quadrat 1:1"
-    @Published var bg = CanvasBackground()
-    @Published var template: CollageTemplate = .free
-    @Published var gap = 0.01
-    @Published var corner = 0.0
+    @Published var ratio: CGFloat = 1 { didSet { touched() } }
+    @Published var aspectName = "Quadrat 1:1" { didSet { touched() } }
+    @Published var bg = CanvasBackground() { didSet { touched() } }
+    @Published var template: CollageTemplate = .free { didSet { touched() } }
+    @Published var gap = 0.01 { didSet { touched() } }
+    @Published var corner = 0.0 { didSet { touched() } }
+    @Published var canUndo = false
+    @Published var canRedo = false
+
+    struct Snap {
+        var layers: [CLayer]
+        var ratio: CGFloat
+        var aspectName: String
+        var bg: CanvasBackground
+        var template: CollageTemplate
+        var gap: Double
+        var corner: Double
+    }
+    private var undoStack: [Snap] = []
+    private var redoStack: [Snap] = []
+    private var lastStable: Snap?
+    private var pendingBefore: Snap?
+    private var restoring = false
+    private var debounce: Task<Void, Never>?
+
+    private func snap() -> Snap {
+        Snap(layers: layers, ratio: ratio, aspectName: aspectName, bg: bg, template: template, gap: gap, corner: corner)
+    }
+
+    private func touched() {
+        guard !restoring else { return }
+        if pendingBefore == nil {
+            pendingBefore = lastStable ?? Snap(layers: [], ratio: 1, aspectName: "Quadrat 1:1", bg: CanvasBackground(), template: .free, gap: 0.01, corner: 0)
+        }
+        debounce?.cancel()
+        debounce = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            if Task.isCancelled { return }
+            self?.flush()
+        }
+    }
+
+    private func flush() {
+        guard let before = pendingBefore else { return }
+        pendingBefore = nil
+        undoStack.append(before)
+        if undoStack.count > 20 { undoStack.removeFirst() }
+        redoStack = []
+        lastStable = snap()
+        canUndo = true
+        canRedo = false
+    }
+
+    private func restore(_ s: Snap) {
+        restoring = true
+        layers = s.layers; ratio = s.ratio; aspectName = s.aspectName
+        bg = s.bg; template = s.template; gap = s.gap; corner = s.corner
+        restoring = false
+        lastStable = s
+        canUndo = !undoStack.isEmpty
+        canRedo = !redoStack.isEmpty
+        if let sel = selected, layer(sel) == nil { selected = layers.last?.id }
+    }
+
+    func undo() {
+        debounce?.cancel()
+        flush()
+        guard let s = undoStack.popLast() else { return }
+        redoStack.append(snap())
+        restore(s)
+    }
+
+    func redo() {
+        debounce?.cancel()
+        flush()
+        guard let s = redoStack.popLast() else { return }
+        undoStack.append(snap())
+        restore(s)
+    }
+
+    // Verzerren (Neigen / Verzerrung / Perspektive)
+    func warped(_ img: UIImage, quad q: [CGPoint]) -> UIImage? {
+        guard let cg = img.cgImage, q.count == 4 else { return nil }
+        let w = CGFloat(cg.width), h = CGFloat(cg.height)
+        let c = CIImage(cgImage: cg).transformed(by: CGAffineTransform(translationX: w / 2, y: h / 2))
+        func pt(_ x: CGFloat, _ y: CGFloat, _ i: Int) -> CIVector {
+            CIVector(x: x + q[i].x * w, y: y - q[i].y * h)
+        }
+        guard let f = CIFilter(name: "CIPerspectiveTransform") else { return nil }
+        f.setValue(c, forKey: kCIInputImageKey)
+        f.setValue(pt(w / 2, 1.5 * h, 0), forKey: "inputTopLeft")
+        f.setValue(pt(1.5 * w, 1.5 * h, 1), forKey: "inputTopRight")
+        f.setValue(pt(1.5 * w, h / 2, 2), forKey: "inputBottomRight")
+        f.setValue(pt(w / 2, h / 2, 3), forKey: "inputBottomLeft")
+        guard let out = f.outputImage,
+              let r = sharedCI.createCGImage(out, from: CGRect(x: 0, y: 0, width: 2 * w, height: 2 * h)) else { return nil }
+        return UIImage(cgImage: r)
+    }
+
+    func rewarp(_ id: UUID) {
+        guard let l = layer(id) else { return }
+        let zero = l.quad.allSatisfy { $0 == .zero }
+        let img = zero ? nil : warped(l.rendered, quad: l.quad)
+        update(id) { $0.shown = img }
+    }
+
+    func toggleLock(_ id: UUID) { update(id) { $0.locked.toggle() } }
     @Published var busy = false
     @Published var message: String?
 
@@ -478,6 +584,7 @@ final class CombineModel: ObservableObject {
         update(id) { l in
             l.rendered = applyLookAndAdjust(l.cut ?? l.source, adjust: l.adjust, look: l.look, amount: l.lookAmount)
         }
+        rewarp(id)
     }
 
     func add(_ imgs: [UIImage], name: String = "Foto") {
@@ -504,6 +611,8 @@ final class CombineModel: ObservableObject {
             l.source = img
             l.cut = nil
             l.rendered = img
+            l.quad = [CGPoint](repeating: .zero, count: 4)
+            l.shown = nil
         }
     }
 
@@ -555,7 +664,12 @@ final class CombineModel: ObservableObject {
     }
 
     func resetTransform(_ id: UUID) {
-        update(id) { $0.offset = .zero; $0.scale = 1; $0.rotation = .zero; $0.flipH = false }
+        update(id) {
+            $0.offset = .zero; $0.scale = 1; $0.rotation = .zero; $0.flipH = false
+            $0.stretch = CGSize(width: 1, height: 1)
+            $0.quad = [CGPoint](repeating: .zero, count: 4)
+            $0.shown = nil
+        }
     }
 
     func hit(_ p: CGPoint, canvas cs: CGSize) {
@@ -565,8 +679,8 @@ final class CombineModel: ObservableObject {
                 rect = CGRect(x: c.minX * cs.width, y: c.minY * cs.height, width: c.width * cs.width, height: c.height * cs.height)
             } else {
                 let f = fitSize(l.rendered.size, within: CGSize(width: cs.width * 0.6, height: cs.height * 0.6))
-                let w = f.width * l.scale
-                let h = f.height * l.scale
+                let w = f.width * l.scale * l.stretch.width
+                let h = f.height * l.scale * l.stretch.height
                 rect = CGRect(x: cs.width / 2 + l.offset.width * cs.width - w / 2,
                               y: cs.height / 2 + l.offset.height * cs.width - h / 2, width: w, height: h)
             }
@@ -622,6 +736,10 @@ enum CLayerCopy {
         c.opacity = l.opacity
         c.blend = l.blend
         c.flipH = l.flipH
+        c.stretch = l.stretch
+        c.quad = l.quad
+        c.shown = l.shown
+        c.locked = l.locked
         return c
     }
 }
@@ -629,7 +747,7 @@ enum CLayerCopy {
 // MARK: - Bildschirm
 
 enum CTab: String, CaseIterable {
-    case aspect, grid, cutout, edit, background, text, sticker
+    case aspect, grid, cutout, edit, transform, background, text, sticker
 
     var title: String {
         switch self {
@@ -637,6 +755,7 @@ enum CTab: String, CaseIterable {
         case .grid: return "Raster"
         case .cutout: return "Ausschnitt"
         case .edit: return "Bearb."
+        case .transform: return "Transf."
         case .background: return "Hintergrund"
         case .text: return "Text"
         case .sticker: return "Sticker"
@@ -649,6 +768,7 @@ enum CTab: String, CaseIterable {
         case .grid: return "square.grid.2x2"
         case .cutout: return "scissors"
         case .edit: return "pencil"
+        case .transform: return "arrow.up.left.and.arrow.down.right"
         case .background: return "circle.grid.3x3"
         case .text: return "textformat"
         case .sticker: return "face.smiling"
@@ -667,6 +787,7 @@ struct CombineScreen: View {
     @State private var smartcutStartAll = true
     @State private var showSmartcut = false
     @State private var editorFor: EditorRequest?
+    @State private var tmode: TMode = .free
 
     var body: some View {
         ZStack {
@@ -748,6 +869,7 @@ struct CombineScreen: View {
                 if m.bg.transparent { checker(cs) }
                 CanvasView(layers: m.layers, bg: m.bg, size: cs, gap: m.gap, corner: m.corner)
                     .overlay(gestureLayer(cs))
+                    .overlay(HandlesLayer(m: m, cs: cs, mode: tab == .transform ? tmode : nil))
                     .shadow(color: .black.opacity(0.5), radius: 8)
                 if m.layers.isEmpty {
                     PhotosPicker(selection: $items, maxSelectionCount: 9, matching: .images) {
@@ -762,7 +884,70 @@ struct CombineScreen: View {
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
+            .overlay(alignment: .bottom) { canvasControls }
         }
+    }
+
+    private func floatBtn(_ icon: String, _ enabled: Bool, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon).font(.body)
+                .frame(width: 38, height: 38)
+                .foregroundStyle(enabled ? Color.white : Color.gray)
+                .background(Color.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 8))
+        }
+        .disabled(!enabled)
+    }
+
+    private var canvasControls: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            floatBtn("arrow.uturn.backward", m.canUndo) { m.undo() }
+            floatBtn("arrow.uturn.forward", m.canRedo) { m.redo() }
+            Spacer()
+            if !m.layers.isEmpty {
+                VStack(alignment: .trailing, spacing: 6) {
+                    ForEach(Array(m.layers.reversed().prefix(3))) { l in
+                        Button { m.selected = l.id } label: {
+                            Image(uiImage: l.rendered).resizable().scaledToFill()
+                                .frame(width: 38, height: 38)
+                                .background(Color(white: 0.2))
+                                .clipShape(RoundedRectangle(cornerRadius: 5))
+                                .overlay(RoundedRectangle(cornerRadius: 5)
+                                    .stroke(m.selected == l.id ? Color.blue : Color.white.opacity(0.5), lineWidth: 2))
+                                .opacity(l.visible ? 1 : 0.4)
+                                .overlay(alignment: .topTrailing) {
+                                    if l.locked { Image(systemName: "lock.fill").font(.system(size: 9)).padding(2) }
+                                }
+                        }
+                    }
+                    HStack(spacing: 6) {
+                        Menu {
+                            if let id = m.selected, let l = m.layer(id) {
+                                Button { m.update(id) { $0.visible.toggle() } } label: {
+                                    Label(l.visible ? "Ausblenden" : "Anzeigen", systemImage: l.visible ? "eye.slash" : "eye")
+                                }
+                                Button { m.duplicate(id) } label: { Label("Kopieren", systemImage: "plus.square.on.square") }
+                                Button { m.toggleLock(id) } label: {
+                                    Label(l.locked ? "Entsperren" : "Sperren", systemImage: l.locked ? "lock.open" : "lock")
+                                }
+                                Button(role: .destructive) { m.remove(id) } label: { Label("Löschen", systemImage: "trash") }
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis").font(.body)
+                                .frame(width: 38, height: 38)
+                                .foregroundStyle(.white)
+                                .background(Color.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 8))
+                        }
+                        PhotosPicker(selection: $items, maxSelectionCount: 9, matching: .images) {
+                            Image(systemName: "plus").font(.body)
+                                .frame(width: 38, height: 38)
+                                .foregroundStyle(.white)
+                                .background(Color.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 8))
+                        }
+                    }
+                }
+            }
+        }
+        .padding(8)
     }
 
     private func checker(_ cs: CGSize) -> some View {
@@ -775,7 +960,7 @@ struct CombineScreen: View {
             .gesture(
                 DragGesture()
                     .onChanged { v in
-                        guard let id = m.selected, let l = m.layer(id) else { return }
+                        guard let id = m.selected, let l = m.layer(id), !l.locked else { return }
                         if dragStart == nil { dragStart = l.offset }
                         let s = dragStart ?? .zero
                         m.update(id) {
@@ -788,7 +973,7 @@ struct CombineScreen: View {
             .simultaneousGesture(
                 MagnifyGesture()
                     .onChanged { v in
-                        guard let id = m.selected, let l = m.layer(id) else { return }
+                        guard let id = m.selected, let l = m.layer(id), !l.locked else { return }
                         if scaleStart == nil { scaleStart = l.scale }
                         let s = scaleStart ?? 1
                         m.update(id) { $0.scale = max(0.1, min(8, s * v.magnification)) }
@@ -798,7 +983,7 @@ struct CombineScreen: View {
             .simultaneousGesture(
                 RotateGesture()
                     .onChanged { v in
-                        guard let id = m.selected, let l = m.layer(id) else { return }
+                        guard let id = m.selected, let l = m.layer(id), !l.locked else { return }
                         if rotStart == nil { rotStart = l.rotation }
                         let s = rotStart ?? .zero
                         m.update(id) { $0.rotation = s + v.rotation }
@@ -860,6 +1045,7 @@ struct CombineScreen: View {
         case .grid: GridPanel(m: m)
         case .cutout: CutoutLayerPanel(m: m, openSmartcut: { all in smartcutStartAll = all; showSmartcut = true })
         case .edit: EditLayerPanel(m: m, items: $items, openEditor: { img, id, t in editorFor = EditorRequest(image: img, layerID: id, tab: t) })
+        case .transform: TransformPanel(m: m, mode: $tmode)
         case .background: BackgroundPanel(m: m)
         case .text: TextPanel(m: m)
         case .sticker: StickerPanel(m: m)
@@ -1366,6 +1552,186 @@ struct StickerPanel: View {
         l.scale = 0.5
         m.layers.append(l)
         m.selected = l.id
+    }
+}
+
+enum TMode: String, CaseIterable, Identifiable {
+    case free, skew, distort, perspective
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .free: return "Freiform"
+        case .skew: return "Neigen"
+        case .distort: return "Verzerrung"
+        case .perspective: return "Perspektive"
+        }
+    }
+    var icon: String {
+        switch self {
+        case .free: return "arrow.up.left.and.arrow.down.right"
+        case .skew: return "square.slash"
+        case .distort: return "skew"
+        case .perspective: return "perspective"
+        }
+    }
+}
+
+struct TransformPanel: View {
+    @ObservedObject var m: CombineModel
+    @Binding var mode: TMode
+
+    var body: some View {
+        VStack(spacing: 16) {
+            HStack(spacing: 14) {
+                ForEach(TMode.allCases) { t in
+                    Button { mode = t } label: {
+                        VStack(spacing: 6) {
+                            Image(systemName: t.icon).font(.title3)
+                                .frame(width: 58, height: 52)
+                                .background(mode == t ? Color.blue : Color(white: 0.18), in: RoundedRectangle(cornerRadius: 8))
+                                .foregroundStyle(.white)
+                            Text(t.title).font(.caption2)
+                                .foregroundStyle(mode == t ? Color.blue : Color.white)
+                        }
+                    }
+                }
+            }
+            Text(mode == .free ? "Ecken ziehen: Breite und Höhe frei ändern."
+                 : mode == .skew ? "Ecken ziehen: Ebene neigen."
+                 : mode == .distort ? "Jede Ecke einzeln verschieben."
+                 : "Ecken ziehen: Perspektive ändern.")
+                .font(.caption).foregroundStyle(.secondary)
+            if let id = m.selected {
+                Button("Transformation zurücksetzen") { m.resetTransform(id) }.font(.footnote)
+            }
+        }
+        .padding(.top, 14)
+    }
+}
+
+struct HandlesLayer: View {
+    @ObservedObject var m: CombineModel
+    let cs: CGSize
+    let mode: TMode?
+    @State private var start: CLayer?
+
+    private let signs: [(CGFloat, CGFloat)] = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
+
+    private func baseSize(_ l: CLayer) -> CGSize {
+        fitSize(l.rendered.size, within: CGSize(width: cs.width * 0.6, height: cs.height * 0.6))
+    }
+    private func dims(_ l: CLayer) -> CGSize {
+        let b = baseSize(l)
+        return CGSize(width: b.width * l.scale * l.stretch.width, height: b.height * l.scale * l.stretch.height)
+    }
+    private func center(_ l: CLayer) -> CGPoint {
+        CGPoint(x: cs.width / 2 + l.offset.width * cs.width, y: cs.height / 2 + l.offset.height * cs.width)
+    }
+    private func rot(_ p: CGPoint, _ a: Double) -> CGPoint {
+        CGPoint(x: p.x * cos(a) - p.y * sin(a), y: p.x * sin(a) + p.y * cos(a))
+    }
+    private func handlePos(_ l: CLayer, _ i: Int) -> CGPoint {
+        let d = dims(l)
+        let fx: CGFloat = l.flipH ? -1 : 1
+        let q = l.quad[i]
+        let local = CGPoint(x: fx * (signs[i].0 * d.width / 2 + q.x * d.width),
+                            y: signs[i].1 * d.height / 2 + q.y * d.height)
+        let r = rot(local, l.rotation.radians)
+        let c = center(l)
+        return CGPoint(x: c.x + r.x, y: c.y + r.y)
+    }
+
+    var body: some View {
+        ZStack {
+            if let l = m.selectedLayer, l.cell == nil, l.visible, !l.locked {
+                let pts = (0..<4).map { handlePos(l, $0) }
+                Path { p in
+                    p.move(to: pts[0])
+                    for q in pts.dropFirst() { p.addLine(to: q) }
+                    p.closeSubpath()
+                }
+                .stroke(Color.white, lineWidth: 1.5).allowsHitTesting(false)
+                ForEach(0..<4, id: \.self) { i in
+                    Circle().fill(Color.white)
+                        .overlay(Circle().stroke(Color.blue, lineWidth: 2))
+                        .frame(width: 16, height: 16)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                        .position(pts[i])
+                        .gesture(drag(i, l.id))
+                }
+            }
+        }
+        .frame(width: cs.width, height: cs.height)
+        .coordinateSpace(name: "cv")
+    }
+
+    private func drag(_ i: Int, _ id: UUID) -> some Gesture {
+        DragGesture(minimumDistance: 0, coordinateSpace: .named("cv"))
+            .onChanged { v in
+                if start == nil { start = m.layer(id) }
+                guard let s = start else { return }
+                apply(i, id, s, v)
+            }
+            .onEnded { _ in
+                start = nil
+                if mode != nil && mode != .free { m.rewarp(id) }
+            }
+    }
+
+    private func apply(_ i: Int, _ id: UUID, _ s: CLayer, _ v: DragGesture.Value) {
+        let a = s.rotation.radians
+        let dl = rot(CGPoint(x: v.translation.width, y: v.translation.height), -a)
+        let fx: CGFloat = s.flipH ? -1 : 1
+        let d = dims(s)
+        guard d.width > 1, d.height > 1 else { return }
+        let sx = signs[i].0, sy = signs[i].1
+        func clamp(_ x: CGFloat) -> CGFloat { min(0.5, max(-0.5, x)) }
+
+        guard let mode else {
+            let c = center(s)
+            let d0 = hypot(v.startLocation.x - c.x, v.startLocation.y - c.y)
+            let d1 = hypot(v.location.x - c.x, v.location.y - c.y)
+            guard d0 > 1 else { return }
+            m.update(id) { $0.scale = max(0.1, min(8, s.scale * d1 / d0)) }
+            return
+        }
+        let dxf = fx * dl.x / d.width
+        let dyf = dl.y / d.height
+        switch mode {
+        case .free:
+            let sdx = fx * sx
+            let nw = max(20, d.width + sdx * dl.x)
+            let nh = max(20, d.height + sy * dl.y)
+            let shiftLocal = CGPoint(x: (nw - d.width) / 2 * sdx, y: (nh - d.height) / 2 * sy)
+            let sh = rot(shiftLocal, a)
+            m.update(id) {
+                $0.stretch = CGSize(width: s.stretch.width * nw / d.width, height: s.stretch.height * nh / d.height)
+                $0.offset = CGSize(width: s.offset.width + sh.x / cs.width, height: s.offset.height + sh.y / cs.width)
+            }
+        case .skew:
+            var q = s.quad
+            let ax = dxf * (-sy)
+            let ay = dyf * sx
+            for k in 0..<4 {
+                q[k].x = clamp(q[k].x + (signs[k].1 < 0 ? ax / 2 : -ax / 2))
+                q[k].y = clamp(q[k].y + (signs[k].0 > 0 ? ay / 2 : -ay / 2))
+            }
+            m.update(id) { $0.quad = q }
+            m.rewarp(id)
+        case .distort:
+            var q = s.quad
+            q[i] = CGPoint(x: clamp(q[i].x + dxf), y: clamp(q[i].y + dyf))
+            m.update(id) { $0.quad = q }
+            m.rewarp(id)
+        case .perspective:
+            var q = s.quad
+            let n = [1, 0, 3, 2][i]
+            q[i] = CGPoint(x: clamp(q[i].x + dxf), y: clamp(q[i].y + dyf))
+            q[n] = CGPoint(x: clamp(q[n].x - dxf), y: clamp(q[n].y + dyf))
+            m.update(id) { $0.quad = q }
+            m.rewarp(id)
+        }
     }
 }
 
