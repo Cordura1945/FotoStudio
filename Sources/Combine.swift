@@ -327,7 +327,7 @@ func renderText(_ s: TextSpec) -> UIImage {
         attrs[.strokeWidth] = -4.0
     }
     let str = NSAttributedString(string: s.text.isEmpty ? " " : s.text, attributes: attrs)
-    let box = str.boundingRect(with: CGSize(width: 1400, height: .greatestFiniteMagnitude),
+    let box = str.boundingRect(with: CGSize(width: 1400, height: CGFloat.greatestFiniteMagnitude),
                                options: [.usesLineFragmentOrigin], context: nil).integral
     let pad: CGFloat = 24
     let size = CGSize(width: max(box.width, 10) + pad * 2, height: max(box.height, 10) + pad * 2)
