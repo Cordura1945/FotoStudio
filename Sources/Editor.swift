@@ -37,6 +37,34 @@ enum RetouchMode: String, CaseIterable, Identifiable {
     }
 }
 
+enum FixTool: String, CaseIterable, Identifiable {
+    case remove, patch, clone, object, more
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .remove: return "Entfernen"
+        case .patch: return "Ausbessern"
+        case .clone: return "Klonen"
+        case .object: return "Objekte entfernen"
+        case .more: return "Mehr"
+        }
+    }
+}
+
+func boxCenter(_ pts: [CGPoint]) -> CGPoint {
+    guard let f = pts.first else { return .zero }
+    var minX = f.x, maxX = f.x, minY = f.y, maxY = f.y
+    for p in pts { minX = min(minX, p.x); maxX = max(maxX, p.x); minY = min(minY, p.y); maxY = max(maxY, p.y) }
+    return CGPoint(x: (minX + maxX) / 2, y: (minY + maxY) / 2)
+}
+
+func boxRect(_ pts: [CGPoint]) -> CGRect {
+    guard let f = pts.first else { return .zero }
+    var minX = f.x, maxX = f.x, minY = f.y, maxY = f.y
+    for p in pts { minX = min(minX, p.x); maxX = max(maxX, p.x); minY = min(minY, p.y); maxY = max(maxY, p.y) }
+    return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+}
+
 // MARK: - Modell
 
 @MainActor
@@ -47,6 +75,17 @@ final class EditorModel: ObservableObject {
     @Published var lookAmount = 1.0
     @Published var thumbs: [LookFilter: UIImage] = [:]
     @Published var canUndo = false
+    @Published var canRedo = false
+    @Published var fixTool: FixTool = .remove
+    @Published var sizePreview = false
+    @Published var patchPts: [CGPoint] = []
+    @Published var patchOffset: CGPoint = .zero
+    @Published var patchScale = 1.0
+    @Published var patchOpacity = 1.0
+    @Published var patchFeather = 0.3
+    @Published var patchBlend = true
+    private var liveBase: CIImage?
+    private var redoStack: [CIImage] = []
     @Published var hasAlpha = false
     @Published var message: String?
 
@@ -78,7 +117,11 @@ final class EditorModel: ObservableObject {
         base = c
         original = c
         undoStack = []
+        redoStack = []
         canUndo = false
+        canRedo = false
+        liveBase = nil
+        patchPts = []
         adjust = Adjust()
         look = .none
         hasAlpha = false
@@ -89,7 +132,7 @@ final class EditorModel: ObservableObject {
     }
 
     func render() {
-        guard let b = base else { return }
+        guard let b = liveBase ?? base else { return }
         let src: CIImage = showingOriginal ? (original ?? b) : process(b)
         if let cg = sharedCI.createCGImage(src, from: src.extent) { display = UIImage(cgImage: cg) }
     }
@@ -124,6 +167,8 @@ final class EditorModel: ObservableObject {
             undoStack.append(b)
             if undoStack.count > 12 { undoStack.removeFirst() }
             canUndo = true
+            redoStack = []
+            canRedo = false
         }
     }
 
@@ -140,9 +185,23 @@ final class EditorModel: ObservableObject {
     }
 
     func undo() {
+        if !patchPts.isEmpty { cancelPatch(); return }
         guard let last = undoStack.popLast() else { return }
+        if let b = base { redoStack.append(b) }
         base = last
         canUndo = !undoStack.isEmpty
+        canRedo = !redoStack.isEmpty
+        thumbsDirty = true
+        render()
+    }
+
+    func redo() {
+        if !patchPts.isEmpty { cancelPatch() }
+        guard let next = redoStack.popLast() else { return }
+        if let b = base { undoStack.append(b) }
+        base = next
+        canUndo = !undoStack.isEmpty
+        canRedo = !redoStack.isEmpty
         thumbsDirty = true
         render()
     }
@@ -224,7 +283,8 @@ final class EditorModel: ObservableObject {
             }
         }
         guard var m = CIImage(image: img) else { return nil }
-        let soft = (1 - hardness) * Double(radius) * 0.5
+        let hd = fixTool == .remove ? 0.7 : hardness
+        let soft = (1 - hd) * Double(radius) * 0.5
         if soft > 0.5 {
             let e = m.extent
             m = m.clampedToExtent().applyingGaussianBlur(sigma: soft).cropped(to: e)
@@ -242,12 +302,7 @@ final class EditorModel: ObservableObject {
         let effect: CIImage
         switch mode {
         case .heal:
-            // Umgebung "diffundiert" in die bemalte Stelle (Fleckenentferner)
-            let holed = b.applyingFilter("CISourceOutCompositing", parameters: [kCIInputBackgroundImageKey: mask])
-            let sigma = max(4, r * 0.7)
-            let fill = ci("CIGaussianBlur", holed, ["inputRadius": sigma]).cropped(to: e)
-            let fallback = blurred(b, sigma * 2)
-            effect = fill.composited(over: fallback)
+            effect = healFill(b, mask: mask, radius: r)
         case .clone:
             guard let src = cloneSource else { return }
             if cloneOffset == nil { cloneOffset = CGPoint(x: start.x - src.x, y: start.y - src.y) }
@@ -271,8 +326,9 @@ final class EditorModel: ObservableObject {
         }
 
         var blendMask = mask
-        if opacity < 1 {
-            blendMask = mask.applyingFilter("CIColorMatrix", parameters: ["inputAVector": CIVector(x: 0, y: 0, z: 0, w: CGFloat(opacity))])
+        let op = fixTool == .remove ? 1.0 : opacity
+        if op < 1 {
+            blendMask = mask.applyingFilter("CIColorMatrix", parameters: ["inputAVector": CIVector(x: 0, y: 0, z: 0, w: CGFloat(op))])
         }
         pushUndo()
         let out = effect.applyingFilter("CIBlendWithAlphaMask", parameters: [
@@ -280,6 +336,147 @@ final class EditorModel: ObservableObject {
             kCIInputMaskImageKey: blendMask
         ]).cropped(to: e)
         bake(out)
+    }
+
+    // Mehrstufige Füllung: Umgebung "diffundiert" in die Lücke
+    private func healFill(_ b: CIImage, mask: CIImage, radius r: Double) -> CIImage {
+        let e = b.extent
+        let holed = b.applyingFilter("CISourceOutCompositing", parameters: [kCIInputBackgroundImageKey: mask])
+        let s1 = max(3, r * 0.35)
+        var fill = ci("CIGaussianBlur", holed, ["inputRadius": s1]).cropped(to: e)
+        for k in [3.0, 9.0] {
+            let l = ci("CIGaussianBlur", holed, ["inputRadius": s1 * k]).cropped(to: e)
+            fill = fill.composited(over: l)
+        }
+        let fallback = blurred(b, s1 * 12)
+        return fill.composited(over: fallback)
+    }
+
+    private func polygonMask(_ pts: [CGPoint], size: CGSize, grow: CGFloat) -> CIImage? {
+        guard pts.count > 2 else { return nil }
+        let fmt = UIGraphicsImageRendererFormat()
+        fmt.scale = 1
+        fmt.opaque = false
+        let img = UIGraphicsImageRenderer(size: size, format: fmt).image { rc in
+            let c = rc.cgContext
+            c.setFillColor(UIColor.white.cgColor)
+            c.setStrokeColor(UIColor.white.cgColor)
+            c.setLineWidth(max(1, grow * 2))
+            c.setLineJoin(.round)
+            c.move(to: pts[0])
+            for p in pts.dropFirst() { c.addLine(to: p) }
+            c.closePath()
+            c.drawPath(using: .fillStroke)
+        }
+        return CIImage(image: img)
+    }
+
+    /// Objekte entfernen: Umkreisen, Fläche wird aus der Umgebung gefüllt.
+    func removeObject(_ pts: [CGPoint]) {
+        guard let b = base, pts.count > 2 else { return }
+        let e = b.extent
+        let box = boxRect(pts)
+        let side = Double(max(box.width, box.height))
+        guard var mask = polygonMask(pts, size: e.size, grow: max(3, CGFloat(side) * 0.04)) else { return }
+        let sm = mask.extent
+        mask = mask.clampedToExtent().applyingGaussianBlur(sigma: max(1.5, side * 0.02)).cropped(to: sm)
+        let fill = healFill(b, mask: mask, radius: max(8, side * 0.5))
+        pushUndo()
+        bake(fill.applyingFilter("CIBlendWithAlphaMask", parameters: [
+            kCIInputBackgroundImageKey: b, kCIInputMaskImageKey: mask
+        ]).cropped(to: e))
+    }
+
+    // MARK: Ausbessern (Blase verschieben / skalieren)
+
+    func selectFix(_ t: FixTool) {
+        if fixTool == .patch && t != .patch { cancelPatch() }
+        fixTool = t
+        switch t {
+        case .remove: mode = .heal
+        case .clone: mode = .clone
+        case .more: if mode == .heal || mode == .clone { mode = .smooth }
+        default: break
+        }
+    }
+
+    func patchBegin(_ pts: [CGPoint]) {
+        patchPts = pts
+        patchOffset = .zero
+        patchScale = 1
+        updatePatch()
+    }
+
+    func cancelPatch() {
+        patchPts = []
+        patchOffset = .zero
+        patchScale = 1
+        liveBase = nil
+        render()
+    }
+
+    func commitPatch() {
+        guard let l = liveBase else { cancelPatch(); return }
+        pushUndo()
+        liveBase = nil
+        patchPts = []
+        patchOffset = .zero
+        patchScale = 1
+        bake(l)
+    }
+
+    func updatePatch() {
+        guard let b = base, patchPts.count > 2 else { liveBase = nil; render(); return }
+        liveBase = patchComposite(b)
+        render()
+    }
+
+    private func average(_ img: CIImage, _ r: CGRect) -> [Double]? {
+        let rr = r.intersection(img.extent)
+        guard !rr.isNull, rr.width > 1, rr.height > 1 else { return nil }
+        let out = ci("CIAreaAverage", img.cropped(to: rr), ["inputExtent": CIVector(cgRect: rr)])
+        var px = [UInt8](repeating: 0, count: 4)
+        sharedCI.render(out, toBitmap: &px, rowBytes: 4,
+                        bounds: CGRect(x: out.extent.minX, y: out.extent.minY, width: 1, height: 1),
+                        format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB())
+        return px.prefix(3).map { Double($0) / 255 }
+    }
+
+    private func patchComposite(_ b: CIImage) -> CIImage {
+        let e = b.extent
+        let H = e.height
+        let c0 = boxCenter(patchPts)
+        let c0f = CGPoint(x: c0.x, y: H - c0.y)
+        let c1f = CGPoint(x: c0f.x + patchOffset.x, y: c0f.y - patchOffset.y)
+        let s = CGFloat(max(0.1, patchScale))
+        let t = CGAffineTransform.identity
+            .translatedBy(x: c0f.x, y: c0f.y)
+            .scaledBy(x: 1 / s, y: 1 / s)
+            .translatedBy(x: -c1f.x, y: -c1f.y)
+        var src = b.clampedToExtent().transformed(by: t).cropped(to: e)
+
+        guard var mask = polygonMask(patchPts, size: e.size, grow: 0) else { return b }
+        let box = boxRect(patchPts)
+        let side = Double(max(box.width, box.height))
+        let sigma = patchFeather * side * 0.12
+        if sigma > 0.5 {
+            let me = mask.extent
+            mask = mask.clampedToExtent().applyingGaussianBlur(sigma: sigma).cropped(to: me)
+        }
+        if patchOpacity < 1 {
+            mask = mask.applyingFilter("CIColorMatrix", parameters: ["inputAVector": CIVector(x: 0, y: 0, z: 0, w: CGFloat(patchOpacity))])
+        }
+        if patchBlend {
+            let rf = CGRect(x: box.minX, y: H - box.maxY, width: box.width, height: box.height)
+            if let a = average(src, rf), let d = average(b, rf) {
+                src = src.applyingFilter("CIColorMatrix", parameters: [
+                    "inputBiasVector": CIVector(x: CGFloat(d[0] - a[0]), y: CGFloat(d[1] - a[1]), z: CGFloat(d[2] - a[2]), w: 0)
+                ]).cropped(to: e)
+            }
+        }
+        return src.applyingFilter("CIBlendWithAlphaMask", parameters: [
+            kCIInputBackgroundImageKey: b, kCIInputMaskImageKey: mask
+        ]).cropped(to: e)
     }
 
     // MARK: Speichern
@@ -356,7 +553,7 @@ struct EditorScreen: View {
                 VStack(spacing: 0) {
                     canvas
                     panel
-                        .frame(height: 200)
+                        .frame(height: tab == .fix ? 240 : 200)
                         .frame(maxWidth: .infinity)
                         .background(Color(white: 0.08))
                     tabBar
@@ -378,10 +575,6 @@ struct EditorScreen: View {
             }
             ToolbarItemGroup(placement: .topBarTrailing) {
                 if m.display != nil {
-                    Image(systemName: "eye")
-                        .onLongPressGesture(minimumDuration: 0, maximumDistance: 60, pressing: { m.setOriginal($0) }, perform: {})
-                    Button { m.undo() } label: { Image(systemName: "arrow.uturn.backward") }
-                        .disabled(!m.canUndo)
                     PhotosPicker(selection: $pick, matching: .images) { Image(systemName: "photo.badge.plus") }
                     if let finish = onFinish {
                         Button("Fertig") {
@@ -436,18 +629,52 @@ struct EditorScreen: View {
                         .frame(width: r.width, height: r.height)
                         .position(x: r.midX, y: r.midY)
                     if tab == .fix {
-                        RetouchLayer(m: m, rect: r, imgSize: img.size)
+                        if m.fixTool == .patch {
+                            PatchLayer(m: m, rect: r, imgSize: img.size)
+                        } else {
+                            RetouchLayer(m: m, rect: r, imgSize: img.size)
+                        }
+                        if m.sizePreview {
+                            Circle().stroke(Color.white, lineWidth: 2)
+                                .background(Circle().fill(Color.white.opacity(0.25)))
+                                .frame(width: CGFloat(m.brushSize) * min(img.size.width, img.size.height) * (r.width / max(img.size.width, 1)) * 2,
+                                       height: CGFloat(m.brushSize) * min(img.size.width, img.size.height) * (r.width / max(img.size.width, 1)) * 2)
+                                .position(x: r.midX, y: r.midY)
+                                .allowsHitTesting(false)
+                        }
                     }
+                    HStack(spacing: 8) {
+                        floatButton("arrow.uturn.backward", enabled: m.canUndo || !m.patchPts.isEmpty) { m.undo() }
+                        floatButton("arrow.uturn.forward", enabled: m.canRedo) { m.redo() }
+                        Spacer()
+                        Image(systemName: "rectangle.split.2x1")
+                            .font(.title3).foregroundStyle(.white)
+                            .frame(width: 44, height: 44)
+                            .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
+                            .onLongPressGesture(minimumDuration: 0, maximumDistance: 80, pressing: { m.setOriginal($0) }, perform: {})
+                    }
+                    .padding(10)
+                    .frame(maxHeight: .infinity, alignment: .bottom)
                 }
             }
         }
+    }
+
+    private func floatButton(_ icon: String, enabled: Bool, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon).font(.title3)
+                .frame(width: 44, height: 44)
+                .foregroundStyle(enabled ? Color.white : Color.gray)
+                .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
+        }
+        .disabled(!enabled)
     }
 
     @ViewBuilder private var panel: some View {
         switch tab {
         case .looks: LooksPanel(m: m)
         case .adjust: AdjustPanel(m: m)
-        case .fix: RetouchPanel(m: m)
+        case .fix: FixPanel(m: m)
         case .crop: CropPanel(m: m)
         case .cutout: CutoutPanel(m: m, open: { showCutout = true })
         }
@@ -480,6 +707,10 @@ struct RetouchLayer: View {
     @State private var pts: [CGPoint] = []
 
     private var scale: CGFloat { rect.width / max(imgSize.width, 1) }
+    private var overlayColor: Color {
+        (m.fixTool == .remove || m.fixTool == .object) ? Color.red.opacity(0.5) : Color.white.opacity(0.45)
+    }
+    private var lineW: CGFloat { m.fixTool == .object ? 4 : diameter }
     private var diameter: CGFloat { CGFloat(m.brushSize) * min(imgSize.width, imgSize.height) * scale * 2 }
 
     private func toImage(_ p: CGPoint) -> CGPoint {
@@ -500,8 +731,16 @@ struct RetouchLayer: View {
                 for q in pts.dropFirst() { path.addLine(to: q) }
                 if pts.count == 1 { path.addLine(to: f) }
             }
-            .stroke(Color.white.opacity(0.45), style: StrokeStyle(lineWidth: diameter, lineCap: .round, lineJoin: .round))
+            .stroke(overlayColor, style: StrokeStyle(lineWidth: lineW, lineCap: .round, lineJoin: .round))
             .allowsHitTesting(false)
+            if m.fixTool == .object, pts.count > 2 {
+                Path { path in
+                    path.move(to: pts[0])
+                    for q in pts.dropFirst() { path.addLine(to: q) }
+                    path.closeSubpath()
+                }
+                .fill(Color.red.opacity(0.3)).allowsHitTesting(false)
+            }
             if let s = m.cloneSource {
                 Image(systemName: "scope").font(.title).foregroundStyle(.yellow)
                     .position(toView(s)).allowsHitTesting(false)
@@ -525,9 +764,113 @@ struct RetouchLayer: View {
             m.cloneSource = first
             m.cloneOffset = nil
             m.pickingSource = false
+        } else if m.fixTool == .object {
+            m.removeObject(ip)
         } else {
             m.applyStroke(ip)
         }
+    }
+}
+
+// MARK: - Ausbessern-Ebene (Blase zeichnen, verschieben, skalieren)
+
+struct PatchLayer: View {
+    @ObservedObject var m: EditorModel
+    let rect: CGRect
+    let imgSize: CGSize
+    @State private var draw: [CGPoint] = []
+    @State private var dragMode = 0
+    @State private var startOffset: CGPoint = .zero
+    @State private var pinchBase: Double?
+
+    private var scale: CGFloat { rect.width / max(imgSize.width, 1) }
+
+    private func toImage(_ p: CGPoint) -> CGPoint {
+        CGPoint(x: min(max((p.x - rect.minX) / scale, 0), imgSize.width),
+                y: min(max((p.y - rect.minY) / scale, 0), imgSize.height))
+    }
+
+    private func shapeView() -> [CGPoint] {
+        let c0 = boxCenter(m.patchPts)
+        let s = CGFloat(m.patchScale)
+        return m.patchPts.map { p in
+            let q = CGPoint(x: c0.x + m.patchOffset.x + (p.x - c0.x) * s,
+                            y: c0.y + m.patchOffset.y + (p.y - c0.y) * s)
+            return CGPoint(x: rect.minX + q.x * scale, y: rect.minY + q.y * scale)
+        }
+    }
+
+    private func closedPath(_ pts: [CGPoint]) -> Path {
+        Path { p in
+            guard let f = pts.first else { return }
+            p.move(to: f)
+            for q in pts.dropFirst() { p.addLine(to: q) }
+            p.closeSubpath()
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            Color.clear.contentShape(Rectangle())
+            if m.patchPts.count > 2 {
+                let sv = shapeView()
+                closedPath(sv).fill(Color.blue.opacity(0.12)).allowsHitTesting(false)
+                closedPath(sv).stroke(Color.blue, lineWidth: 2.5).allowsHitTesting(false)
+            }
+            Path { p in
+                guard let f = draw.first else { return }
+                p.move(to: f)
+                for q in draw.dropFirst() { p.addLine(to: q) }
+            }
+            .stroke(Color.blue, style: StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
+            .allowsHitTesting(false)
+            if m.patchPts.isEmpty && draw.isEmpty {
+                Text("Umkreise die Stelle, die du ausbessern möchtest")
+                    .font(.caption).padding(8)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .frame(maxHeight: .infinity, alignment: .top).padding(.top, 10)
+                    .allowsHitTesting(false)
+            }
+        }
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { v in
+                    if dragMode == 0 {
+                        if m.patchPts.count > 2, closedPath(shapeView()).contains(v.startLocation) {
+                            dragMode = 2
+                            startOffset = m.patchOffset
+                        } else {
+                            dragMode = 1
+                            if !m.patchPts.isEmpty { m.cancelPatch() }
+                        }
+                    }
+                    if dragMode == 2 {
+                        m.patchOffset = CGPoint(x: startOffset.x + v.translation.width / scale,
+                                                y: startOffset.y + v.translation.height / scale)
+                        m.updatePatch()
+                    } else {
+                        if let l = draw.last, hypot(l.x - v.location.x, l.y - v.location.y) < 2 { return }
+                        draw.append(v.location)
+                    }
+                }
+                .onEnded { _ in
+                    if dragMode == 1 {
+                        if draw.count > 8 { m.patchBegin(draw.map(toImage)) }
+                        draw = []
+                    }
+                    dragMode = 0
+                }
+        )
+        .simultaneousGesture(
+            MagnifyGesture()
+                .onChanged { v in
+                    guard m.patchPts.count > 2 else { return }
+                    if pinchBase == nil { pinchBase = m.patchScale }
+                    m.patchScale = min(3, max(0.3, (pinchBase ?? 1) * Double(v.magnification)))
+                    m.updatePatch()
+                }
+                .onEnded { _ in pinchBase = nil }
+        )
     }
 }
 
@@ -658,54 +1001,162 @@ struct CropPanel: View {
     }
 }
 
-struct RetouchPanel: View {
+enum FixOpt { case size, hardness, opacity, feather }
+
+struct FixPanel: View {
     @ObservedObject var m: EditorModel
+    @State private var opt: FixOpt = .size
+
+    private var brushTool: Bool { m.fixTool == .remove || m.fixTool == .clone || m.fixTool == .more }
+
+    private var sliderBinding: Binding<Double> {
+        switch (m.fixTool, opt) {
+        case (.patch, .size):
+            return Binding(get: { m.patchScale }, set: { m.patchScale = $0; m.updatePatch() })
+        case (.patch, .opacity):
+            return Binding(get: { m.patchOpacity }, set: { m.patchOpacity = $0; m.updatePatch() })
+        case (.patch, _):
+            return Binding(get: { m.patchFeather }, set: { m.patchFeather = $0; m.updatePatch() })
+        case (_, .hardness): return $m.hardness
+        case (_, .opacity): return $m.opacity
+        default: return $m.brushSize
+        }
+    }
+
+    private var range: ClosedRange<Double> {
+        switch (m.fixTool, opt) {
+        case (.patch, .size): return 0.3...3
+        case (.patch, .opacity): return 0.05...1
+        case (.patch, _): return 0...1
+        case (_, .hardness): return 0...1
+        case (_, .opacity): return 0.05...1
+        default: return 0.01...0.2
+        }
+    }
+
+    private var valueText: String {
+        let v = sliderBinding.wrappedValue
+        let r = range
+        return "\(Int(((v - r.lowerBound) / (r.upperBound - r.lowerBound) * 100).rounded()))"
+    }
+
+    private var showSlider: Bool { m.fixTool != .object }
 
     var body: some View {
-        ScrollView {
+        VStack(spacing: 8) {
+            if showSlider {
+                HStack {
+                    Slider(value: sliderBinding, in: range, onEditingChanged: { editing in
+                        m.sizePreview = editing && opt == .size && brushTool
+                    })
+                    Text(valueText).monospacedDigit().font(.footnote).frame(width: 36)
+                }
+                .padding(.horizontal)
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 22) {
+                    ForEach(FixTool.allCases) { t in
+                        Button { m.selectFix(t); opt = .size } label: {
+                            Text(t.title).font(.subheadline)
+                                .foregroundStyle(m.fixTool == t ? Color.blue : Color.white)
+                        }
+                    }
+                }
+                .padding(.horizontal)
+            }
+            .frame(height: 28)
+            options
+            Spacer(minLength: 0)
+        }
+        .padding(.top, 10)
+    }
+
+    @ViewBuilder private var options: some View {
+        switch m.fixTool {
+        case .remove:
             VStack(spacing: 10) {
+                optionRow([(.size, "Größe", "circle.dashed")])
+                hint("Male über das Objekt, das du entfernen möchtest.")
+            }
+        case .object:
+            VStack(spacing: 10) {
+                Image(systemName: "lasso.badge.sparkles").font(.title)
+                hint("Umkreise das Objekt, es wird aus der Umgebung ersetzt.")
+            }
+        case .clone:
+            VStack(spacing: 8) {
+                optionRow([(.size, "Größe", "circle.dashed"), (.hardness, "Härte", "circle.lefthalf.filled"), (.opacity, "Deckkraft", "checkerboard.rectangle")])
+                HStack {
+                    Text(m.cloneSource == nil || m.pickingSource ? "Tippe auf die Quelle, dann male." : "Quelle gesetzt – male auf die Zielstelle.")
+                        .font(.caption)
+                    Spacer()
+                    Button("Quelle neu") { m.pickingSource = true }.font(.caption.bold())
+                }.padding(.horizontal)
+            }
+        case .patch:
+            VStack(spacing: 8) {
+                HStack(spacing: 14) {
+                    optionRow([(.size, "Größe", "arrow.up.left.and.arrow.down.right"), (.opacity, "Deckkraft", "checkerboard.rectangle"), (.feather, "Verwischen", "circle.fill")])
+                    Divider().frame(height: 50)
+                    VStack(spacing: 4) {
+                        Toggle("", isOn: Binding(get: { m.patchBlend }, set: { m.patchBlend = $0; m.updatePatch() }))
+                            .labelsHidden()
+                        Text("Mischen").font(.caption2).foregroundStyle(.blue)
+                    }
+                }
+                if m.patchPts.count > 2 {
+                    HStack(spacing: 20) {
+                        Button { m.cancelPatch() } label: { Label("Verwerfen", systemImage: "xmark") }
+                        Button { m.commitPatch() } label: { Label("Anwenden", systemImage: "checkmark").bold() }
+                    }
+                    .font(.footnote)
+                } else {
+                    hint("Blase ziehen = Quelle wählen, zwei Finger = größer/kleiner.")
+                }
+            }
+        case .more:
+            VStack(spacing: 8) {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
-                        ForEach(RetouchMode.allCases) { r in
+                        ForEach(RetouchMode.allCases.filter { $0 != .heal && $0 != .clone }) { r in
                             Button { m.mode = r } label: {
                                 VStack(spacing: 3) {
                                     Image(systemName: r.icon).font(.title3)
                                     Text(r.title).font(.caption2)
                                 }
-                                .frame(width: 84, height: 52)
+                                .frame(width: 84, height: 50)
                                 .foregroundStyle(m.mode == r ? Color.white : Color.gray)
                                 .background(m.mode == r ? Color.blue.opacity(0.6) : Color(white: 0.15),
                                             in: RoundedRectangle(cornerRadius: 10))
                             }
                         }
-                    }
-                    .padding(.horizontal)
+                    }.padding(.horizontal)
                 }
-                if m.mode == .clone {
-                    HStack {
-                        Text(m.cloneSource == nil || m.pickingSource ? "Tippe auf die Quelle, dann male."
-                                                                       : "Quelle gesetzt – male auf die Zielstelle.")
-                            .font(.caption)
-                        Spacer()
-                        Button("Quelle neu") { m.pickingSource = true }.font(.caption.bold())
-                    }
-                    .padding(.horizontal)
-                }
-                slider("Größe", $m.brushSize, 0.01...0.2)
-                slider("Härte", $m.hardness, 0...1)
-                slider("Deckkraft", $m.opacity, 0.05...1)
                 Button("Rote Augen automatisch korrigieren") { m.redEye() }.font(.footnote)
             }
-            .padding(.top, 10)
         }
     }
 
-    private func slider(_ t: String, _ v: Binding<Double>, _ r: ClosedRange<Double>) -> some View {
-        HStack {
-            Text(t).font(.footnote).frame(width: 70, alignment: .leading)
-            Slider(value: v, in: r)
+    private func hint(_ t: String) -> some View {
+        Text(t).font(.caption).foregroundStyle(.secondary)
+            .multilineTextAlignment(.center).padding(.horizontal)
+    }
+
+    private func optionRow(_ items: [(FixOpt, String, String)]) -> some View {
+        HStack(spacing: 10) {
+            ForEach(items, id: \.1) { it in
+                Button { opt = it.0 } label: {
+                    VStack(spacing: 4) {
+                        Image(systemName: it.2).font(.title3)
+                            .frame(width: 56, height: 46)
+                            .background(opt == it.0 ? Color.blue : Color(white: 0.18), in: RoundedRectangle(cornerRadius: 8))
+                            .foregroundStyle(.white)
+                        Text(it.1).font(.caption2)
+                            .foregroundStyle(opt == it.0 ? Color.blue : Color.white)
+                    }
+                }
+            }
         }
-        .padding(.horizontal)
     }
 }
 
