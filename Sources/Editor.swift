@@ -79,8 +79,11 @@ final class EditorModel: ObservableObject {
     @Published var fixTool: FixTool = .remove
     @Published var sizePreview = false
     @Published var patchPts: [CGPoint] = []
-    @Published var patchOffset: CGPoint = .zero
-    @Published var patchScale = 1.0
+    @Published var tOff: CGPoint = .zero      // Ziel-Blase: Verschiebung
+    @Published var tScale = 1.0
+    @Published var sOff: CGPoint = .zero      // Quell-Blase: Verschiebung
+    @Published var sScale = 1.0
+    @Published var patchSel = 0               // 0 = Ziel, 1 = Quelle
     @Published var patchOpacity = 1.0
     @Published var patchFeather = 0.3
     @Published var patchBlend = true
@@ -402,26 +405,33 @@ final class EditorModel: ObservableObject {
 
     func patchBegin(_ pts: [CGPoint]) {
         patchPts = pts
-        patchOffset = .zero
-        patchScale = 1
+        let box = boxRect(pts)
+        let w = box.width * 1.3
+        let right = box.midX + w + box.width / 2 < imageSize.width
+        tOff = .zero
+        tScale = 1
+        sOff = CGPoint(x: right ? w : -w, y: 0)
+        sScale = 1
+        patchSel = 1
         updatePatch()
     }
 
-    func cancelPatch() {
+    private func resetPatchState() {
         patchPts = []
-        patchOffset = .zero
-        patchScale = 1
+        tOff = .zero; sOff = .zero
+        tScale = 1; sScale = 1
         liveBase = nil
+    }
+
+    func cancelPatch() {
+        resetPatchState()
         render()
     }
 
     func commitPatch() {
         guard let l = liveBase else { cancelPatch(); return }
         pushUndo()
-        liveBase = nil
-        patchPts = []
-        patchOffset = .zero
-        patchScale = 1
+        resetPatchState()
         bake(l)
     }
 
@@ -446,17 +456,24 @@ final class EditorModel: ObservableObject {
         let e = b.extent
         let H = e.height
         let c0 = boxCenter(patchPts)
-        let c0f = CGPoint(x: c0.x, y: H - c0.y)
-        let c1f = CGPoint(x: c0f.x + patchOffset.x, y: c0f.y - patchOffset.y)
-        let s = CGFloat(max(0.1, patchScale))
+        let T = CGPoint(x: c0.x + tOff.x, y: c0.y + tOff.y)
+        let S = CGPoint(x: c0.x + sOff.x, y: c0.y + sOff.y)
+        let ts = CGFloat(max(0.1, tScale))
+        let ss = CGFloat(max(0.1, sScale))
+        let rho = ss / ts
+        let Tf = CGPoint(x: T.x, y: H - T.y)
+        let Sf = CGPoint(x: S.x, y: H - S.y)
         let t = CGAffineTransform.identity
-            .translatedBy(x: c0f.x, y: c0f.y)
-            .scaledBy(x: 1 / s, y: 1 / s)
-            .translatedBy(x: -c1f.x, y: -c1f.y)
+            .translatedBy(x: Tf.x, y: Tf.y)
+            .scaledBy(x: 1 / rho, y: 1 / rho)
+            .translatedBy(x: -Sf.x, y: -Sf.y)
         var src = b.clampedToExtent().transformed(by: t).cropped(to: e)
 
-        guard var mask = polygonMask(patchPts, size: e.size, grow: 0) else { return b }
-        let box = boxRect(patchPts)
+        let dest = patchPts.map { p in
+            CGPoint(x: T.x + (p.x - c0.x) * ts, y: T.y + (p.y - c0.y) * ts)
+        }
+        guard var mask = polygonMask(dest, size: e.size, grow: 0) else { return b }
+        let box = boxRect(dest)
         let side = Double(max(box.width, box.height))
         let sigma = patchFeather * side * 0.12
         if sigma > 0.5 {
@@ -528,6 +545,11 @@ struct EditorScreen: View {
     @State private var pick: PhotosPickerItem?
     @State private var tab: EditorTab
     @State private var showCutout = false
+    @State private var zoom: CGFloat = 1
+    @State private var zoomBase: CGFloat = 1
+    @State private var pan: CGSize = .zero
+    @State private var panBase: CGSize = .zero
+    @State private var hand = false
     @Environment(\.dismiss) private var dismiss
 
     init(startImage: UIImage? = nil, onFinish: ((UIImage) -> Void)? = nil, startTab: EditorTab = .adjust) {
@@ -553,7 +575,7 @@ struct EditorScreen: View {
                 VStack(spacing: 0) {
                     canvas
                     panel
-                        .frame(height: tab == .fix ? 240 : 200)
+                        .frame(height: tab == .fix ? 270 : 200)
                         .frame(maxWidth: .infinity)
                         .background(Color(white: 0.08))
                     tabBar
@@ -620,33 +642,65 @@ struct EditorScreen: View {
         }
     }
 
+    private func clampedPan(_ p: CGSize, _ size: CGSize, _ z: CGFloat) -> CGSize {
+        let mx = size.width * (z - 1) / 2 + 40
+        let my = size.height * (z - 1) / 2 + 40
+        return CGSize(width: min(max(p.width, -mx), mx), height: min(max(p.height, -my), my))
+    }
+
     private var canvas: some View {
         GeometryReader { geo in
             if let img = m.display {
                 let r = fitRect(img.size, in: geo.size)
                 ZStack {
-                    Image(uiImage: img).resizable()
-                        .frame(width: r.width, height: r.height)
-                        .position(x: r.midX, y: r.midY)
-                    if tab == .fix {
-                        if m.fixTool == .patch {
-                            PatchLayer(m: m, rect: r, imgSize: img.size)
-                        } else {
-                            RetouchLayer(m: m, rect: r, imgSize: img.size)
+                    ZStack {
+                        Image(uiImage: img).resizable()
+                            .frame(width: r.width, height: r.height)
+                            .position(x: r.midX, y: r.midY)
+                        if tab == .fix {
+                            Group {
+                                if m.fixTool == .patch {
+                                    PatchLayer(m: m, rect: r, imgSize: img.size)
+                                } else {
+                                    RetouchLayer(m: m, rect: r, imgSize: img.size)
+                                }
+                            }
+                            .allowsHitTesting(!hand)
+                            if m.sizePreview {
+                                let d = CGFloat(m.brushSize) * min(img.size.width, img.size.height) * (r.width / max(img.size.width, 1)) * 2
+                                Circle().stroke(Color.white, lineWidth: 2)
+                                    .background(Circle().fill(Color.white.opacity(0.25)))
+                                    .frame(width: d, height: d)
+                                    .position(x: r.midX, y: r.midY)
+                                    .allowsHitTesting(false)
+                            }
                         }
-                        if m.sizePreview {
-                            Circle().stroke(Color.white, lineWidth: 2)
-                                .background(Circle().fill(Color.white.opacity(0.25)))
-                                .frame(width: CGFloat(m.brushSize) * min(img.size.width, img.size.height) * (r.width / max(img.size.width, 1)) * 2,
-                                       height: CGFloat(m.brushSize) * min(img.size.width, img.size.height) * (r.width / max(img.size.width, 1)) * 2)
-                                .position(x: r.midX, y: r.midY)
-                                .allowsHitTesting(false)
-                        }
+                    }
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .scaleEffect(zoom)
+                    .offset(pan)
+                    if hand {
+                        Color.clear.contentShape(Rectangle())
+                            .gesture(
+                                DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                                    .onChanged { v in
+                                        pan = clampedPan(CGSize(width: panBase.width + v.translation.width,
+                                                                height: panBase.height + v.translation.height), geo.size, zoom)
+                                    }
+                                    .onEnded { _ in panBase = pan }
+                            )
+                            .onTapGesture(count: 2) { withAnimation { zoom = 1; zoomBase = 1; pan = .zero; panBase = .zero } }
                     }
                     HStack(spacing: 8) {
                         floatButton("arrow.uturn.backward", enabled: m.canUndo || !m.patchPts.isEmpty) { m.undo() }
                         floatButton("arrow.uturn.forward", enabled: m.canRedo) { m.redo() }
                         Spacer()
+                        Button { hand.toggle() } label: {
+                            Image(systemName: hand ? "hand.draw.fill" : "hand.draw").font(.title3)
+                                .frame(width: 44, height: 44)
+                                .foregroundStyle(hand ? Color.blue : Color.white)
+                                .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
+                        }
                         Image(systemName: "rectangle.split.2x1")
                             .font(.title3).foregroundStyle(.white)
                             .frame(width: 44, height: 44)
@@ -656,6 +710,15 @@ struct EditorScreen: View {
                     .padding(10)
                     .frame(maxHeight: .infinity, alignment: .bottom)
                 }
+                .clipped()
+                .simultaneousGesture(
+                    MagnifyGesture()
+                        .onChanged { v in
+                            zoom = min(8, max(1, zoomBase * v.magnification))
+                            pan = clampedPan(pan, geo.size, zoom)
+                        }
+                        .onEnded { _ in zoomBase = zoom; panBase = pan }
+                )
             }
         }
     }
@@ -779,9 +842,8 @@ struct PatchLayer: View {
     let rect: CGRect
     let imgSize: CGSize
     @State private var draw: [CGPoint] = []
-    @State private var dragMode = 0
-    @State private var startOffset: CGPoint = .zero
-    @State private var pinchBase: Double?
+    @State private var dragMode = 0          // 0 offen, 1 zeichnen, 2 Ziel, 3 Quelle
+    @State private var startOff: CGPoint = .zero
 
     private var scale: CGFloat { rect.width / max(imgSize.width, 1) }
 
@@ -790,12 +852,13 @@ struct PatchLayer: View {
                 y: min(max((p.y - rect.minY) / scale, 0), imgSize.height))
     }
 
-    private func shapeView() -> [CGPoint] {
+    private func shapeView(source: Bool) -> [CGPoint] {
         let c0 = boxCenter(m.patchPts)
-        let s = CGFloat(m.patchScale)
+        let off = source ? m.sOff : m.tOff
+        let s = CGFloat(source ? m.sScale : m.tScale)
         return m.patchPts.map { p in
-            let q = CGPoint(x: c0.x + m.patchOffset.x + (p.x - c0.x) * s,
-                            y: c0.y + m.patchOffset.y + (p.y - c0.y) * s)
+            let q = CGPoint(x: c0.x + off.x + (p.x - c0.x) * s,
+                            y: c0.y + off.y + (p.y - c0.y) * s)
             return CGPoint(x: rect.minX + q.x * scale, y: rect.minY + q.y * scale)
         }
     }
@@ -809,13 +872,31 @@ struct PatchLayer: View {
         }
     }
 
+    private func arrow(from a: CGPoint, to b: CGPoint) -> Path {
+        Path { p in
+            let d = hypot(b.x - a.x, b.y - a.y)
+            guard d > 20 else { return }
+            p.move(to: a); p.addLine(to: b)
+            let ang = atan2(b.y - a.y, b.x - a.x)
+            for da in [CGFloat.pi * 0.85, -CGFloat.pi * 0.85] {
+                p.move(to: b)
+                p.addLine(to: CGPoint(x: b.x + 12 * cos(ang + da), y: b.y + 12 * sin(ang + da)))
+            }
+        }
+    }
+
     var body: some View {
         ZStack {
             Color.clear.contentShape(Rectangle())
             if m.patchPts.count > 2 {
-                let sv = shapeView()
-                closedPath(sv).fill(Color.blue.opacity(0.12)).allowsHitTesting(false)
-                closedPath(sv).stroke(Color.blue, lineWidth: 2.5).allowsHitTesting(false)
+                let tv = shapeView(source: false)
+                let sv = shapeView(source: true)
+                closedPath(tv).fill(Color.blue.opacity(0.12)).allowsHitTesting(false)
+                closedPath(tv).stroke(Color.blue, lineWidth: m.patchSel == 0 ? 3.5 : 2).allowsHitTesting(false)
+                closedPath(sv).stroke(Color.cyan, style: StrokeStyle(lineWidth: m.patchSel == 1 ? 3.5 : 2, dash: [7, 4]))
+                    .allowsHitTesting(false)
+                arrow(from: boxCenter(sv), to: boxCenter(tv)).stroke(Color.white, lineWidth: 2)
+                    .allowsHitTesting(false)
             }
             Path { p in
                 guard let f = draw.first else { return }
@@ -836,17 +917,25 @@ struct PatchLayer: View {
             DragGesture(minimumDistance: 0)
                 .onChanged { v in
                     if dragMode == 0 {
-                        if m.patchPts.count > 2, closedPath(shapeView()).contains(v.startLocation) {
-                            dragMode = 2
-                            startOffset = m.patchOffset
-                        } else {
+                        if m.patchPts.count > 2 {
+                            let inT = closedPath(shapeView(source: false)).contains(v.startLocation)
+                            let inS = closedPath(shapeView(source: true)).contains(v.startLocation)
+                            if inT && inS { dragMode = m.patchSel == 1 ? 3 : 2 }
+                            else if inS { dragMode = 3 }
+                            else if inT { dragMode = 2 }
+                        }
+                        if dragMode == 0 {
                             dragMode = 1
                             if !m.patchPts.isEmpty { m.cancelPatch() }
+                        } else {
+                            m.patchSel = dragMode == 3 ? 1 : 0
+                            startOff = dragMode == 3 ? m.sOff : m.tOff
                         }
                     }
-                    if dragMode == 2 {
-                        m.patchOffset = CGPoint(x: startOffset.x + v.translation.width / scale,
-                                                y: startOffset.y + v.translation.height / scale)
+                    if dragMode >= 2 {
+                        let n = CGPoint(x: startOff.x + v.translation.width / scale,
+                                        y: startOff.y + v.translation.height / scale)
+                        if dragMode == 3 { m.sOff = n } else { m.tOff = n }
                         m.updatePatch()
                     } else {
                         if let l = draw.last, hypot(l.x - v.location.x, l.y - v.location.y) < 2 { return }
@@ -860,16 +949,6 @@ struct PatchLayer: View {
                     }
                     dragMode = 0
                 }
-        )
-        .simultaneousGesture(
-            MagnifyGesture()
-                .onChanged { v in
-                    guard m.patchPts.count > 2 else { return }
-                    if pinchBase == nil { pinchBase = m.patchScale }
-                    m.patchScale = min(3, max(0.3, (pinchBase ?? 1) * Double(v.magnification)))
-                    m.updatePatch()
-                }
-                .onEnded { _ in pinchBase = nil }
         )
     }
 }
@@ -1006,13 +1085,15 @@ enum FixOpt { case size, hardness, opacity, feather }
 struct FixPanel: View {
     @ObservedObject var m: EditorModel
     @State private var opt: FixOpt = .size
+    @State private var editing = false
 
     private var brushTool: Bool { m.fixTool == .remove || m.fixTool == .clone || m.fixTool == .more }
 
     private var sliderBinding: Binding<Double> {
         switch (m.fixTool, opt) {
         case (.patch, .size):
-            return Binding(get: { m.patchScale }, set: { m.patchScale = $0; m.updatePatch() })
+            return Binding(get: { m.tScale },
+                           set: { m.tScale = $0; m.sScale = $0; m.updatePatch() })
         case (.patch, .opacity):
             return Binding(get: { m.patchOpacity }, set: { m.patchOpacity = $0; m.updatePatch() })
         case (.patch, _):
@@ -1046,10 +1127,14 @@ struct FixPanel: View {
         VStack(spacing: 8) {
             if showSlider {
                 HStack {
-                    Slider(value: sliderBinding, in: range, onEditingChanged: { editing in
-                        m.sizePreview = editing && opt == .size && brushTool
+                    Slider(value: sliderBinding, in: range, onEditingChanged: { e in
+                        editing = e
+                        m.sizePreview = e && opt == .size && brushTool
                     })
-                    Text(valueText).monospacedDigit().font(.footnote).frame(width: 36)
+                    Text(valueText).monospacedDigit().font(.footnote)
+                        .padding(.horizontal, 6).padding(.vertical, 3)
+                        .background(editing ? Color.gray.opacity(0.5) : Color.clear, in: RoundedRectangle(cornerRadius: 4))
+                        .frame(width: 44)
                 }
                 .padding(.horizontal)
             }
@@ -1076,7 +1161,7 @@ struct FixPanel: View {
         case .remove:
             VStack(spacing: 10) {
                 optionRow([(.size, "Größe", "circle.dashed")])
-                hint("Male über das Objekt, das du entfernen möchtest.")
+                hint("Tippe oder ziehe über den Bereich, um unerwünschte Objekte oder Unreinheiten zu entfernen. Der Regler stellt die Pinselgröße ein.")
             }
         case .object:
             VStack(spacing: 10) {
@@ -1105,13 +1190,13 @@ struct FixPanel: View {
                     }
                 }
                 if m.patchPts.count > 2 {
-                    HStack(spacing: 20) {
+                    HStack(spacing: 14) {
                         Button { m.cancelPatch() } label: { Label("Verwerfen", systemImage: "xmark") }
                         Button { m.commitPatch() } label: { Label("Anwenden", systemImage: "checkmark").bold() }
                     }
                     .font(.footnote)
                 } else {
-                    hint("Blase ziehen = Quelle wählen, zwei Finger = größer/kleiner.")
+                    hint("Umkreise den Fehler. Ziehe die Quell-Blase (gestrichelt) auf eine saubere Stelle. Der Regler macht beide Blasen größer oder kleiner.")
                 }
             }
         case .more:
