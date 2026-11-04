@@ -6,22 +6,32 @@ import CoreImage
 
 // MARK: - App
 
+/// Datei, die über „Öffnen in …“ / Teilen-Menü in der App ankommt.
+final class Incoming: ObservableObject {
+    static let shared = Incoming()
+    @Published var url: URL?
+}
+
 @main
 struct FotoStudioApp: App {
     var body: some Scene {
         WindowGroup {
             HomeView()
                 .preferredColorScheme(.dark)
+                .onOpenURL { url in Incoming.shared.url = url }
         }
     }
 }
 
 /// Wird bei jeder Lieferung hochgezählt, damit man sieht, welche Fassung installiert ist.
-let appBuildTag = "Build 9"
+let appBuildTag = "Build 10"
 
 // MARK: - Startseite (Aufbau wie Photoshop Express)
 
 struct HomeView: View {
+    @ObservedObject private var incoming = Incoming.shared
+    @State private var showPSD = false
+
     var body: some View {
         NavigationStack {
             ZStack {
@@ -79,6 +89,10 @@ struct HomeView: View {
                 }
             }
             .toolbar(.hidden, for: .navigationBar)
+            .navigationDestination(isPresented: $showPSD) { PSDScreen() }
+            .onChange(of: incoming.url) { _, u in
+                if u != nil { showPSD = true }
+            }
         }
     }
 
