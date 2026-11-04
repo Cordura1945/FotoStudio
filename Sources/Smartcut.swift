@@ -23,6 +23,10 @@ final class CutoutEngine: ObservableObject {
     @Published var smooth: Double = 0 { didSet { renderPreview() } }
     @Published var shift: Double = 0 { didSet { renderPreview() } }
     @Published var showRed = false { didSet { renderPreview() } }
+    /// Umkehren: tauscht Ausgeschnittenes und Entferntes (wie bei Photoshop Express)
+    @Published var inverted = false { didSet { renderPreview() } }
+    private var fractions: [Int: Double] = [:]
+    private func eff(_ add: Bool) -> Bool { inverted ? !add : add }
 
     private var bundle: VisionBundle?
     private var instanceMasks: [Int: CIImage] = [:]
@@ -164,11 +168,29 @@ final class CutoutEngine: ObservableObject {
     /// Objekt unter dem Finger hinzufügen/entfernen. Gibt false zurück, wenn dort kein Objekt erkannt wurde.
     @discardableResult
     func smartTap(at p: CGPoint, add: Bool) -> Bool {
-        guard let l = label(at: p) else { return false }
+        // Riesige „Objekte“ (fast das ganze Bild) überspringen – dann greift der Farbbereich unterm Finger
+        guard let l = label(at: p), instanceFraction(l) < 0.6 else { return false }
         pushUndo()
-        if add { selected.insert(l) } else { selected.remove(l) }
+        if eff(add) { selected.insert(l) } else { selected.remove(l) }
         rebuild()
         return true
+    }
+
+    /// Anteil des Bildes, den ein erkanntes Objekt einnimmt (0...1)
+    private func instanceFraction(_ l: Int) -> Double {
+        if let f = fractions[l] { return f }
+        guard let b = bundle else { return 0 }
+        let buf = b.obs.instanceMask
+        CVPixelBufferLockBaseAddress(buf, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buf, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buf) else { return 0 }
+        let w = CVPixelBufferGetWidth(buf), h = CVPixelBufferGetHeight(buf)
+        let bpr = CVPixelBufferGetBytesPerRow(buf)
+        var n = 0
+        for y in 0..<h { for x in 0..<w where Int(base.load(fromByteOffset: y * bpr + x, as: UInt8.self)) == l { n += 1 } }
+        let f = Double(n) / Double(max(w * h, 1))
+        fractions[l] = f
+        return f
     }
 
     // MARK: Zauberstab (Fallback, wenn Vision nichts erkennt)
@@ -231,8 +253,8 @@ final class CutoutEngine: ObservableObject {
             .transformed(by: CGAffineTransform(scaleX: extent.width / CGFloat(w), y: extent.height / CGFloat(h)))
         m = blurred(m.clampedToExtent(), 1.5).cropped(to: extent)
         pushUndo()
-        strokes.append((m, add))
-        baseMask = bake(applyOne(m, add: add, to: baseMask).cropped(to: extent))
+        strokes.append((m, eff(add)))
+        baseMask = bake(applyOne(m, add: eff(add), to: baseMask).cropped(to: extent))
         renderPreview()
         return true
     }
@@ -280,6 +302,7 @@ final class CutoutEngine: ObservableObject {
         let bpr = CVPixelBufferGetBytesPerRow(buf)
         let x0 = Int(b.minX / extent.width * CGFloat(w)), x1 = Int(b.maxX / extent.width * CGFloat(w))
         let y0 = Int(b.minY / extent.height * CGFloat(h)), y1 = Int(b.maxY / extent.height * CGFloat(h))
+        let boxPx = max(1, (x1 - x0) * (y1 - y0))
         var total: [Int: Int] = [:]
         var inside: [Int: Int] = [:]
         for y in 0..<h {
@@ -291,7 +314,12 @@ final class CutoutEngine: ObservableObject {
             }
         }
         var out = IndexSet()
-        for (k, t) in total where Double(inside[k] ?? 0) / Double(t) >= 0.6 { out.insert(k) }
+        for (k, t) in total {
+            if Double(t) / Double(max(w * h, 1)) >= 0.6 { continue }   // fast bildfüllend: zu grob
+            let i = Double(inside[k] ?? 0)
+            // Objekt liegt (fast) im Kästchen ODER füllt den größten Teil des Kästchens aus
+            if i / Double(t) >= 0.6 || i / Double(boxPx) >= 0.5 { out.insert(k) }
+        }
         return out
     }
 
@@ -401,6 +429,13 @@ final class CutoutEngine: ObservableObject {
         return maskImage(mask, w: w, h: h)
     }
 
+    private func rectMask(_ b: CGRect) -> CIImage {
+        let r = CGRect(x: b.minX, y: extent.height - b.maxY, width: b.width, height: b.height)
+        let white = CIImage(color: CIColor.white).cropped(to: r)
+        let m = white.composited(over: CIImage(color: CIColor.black).cropped(to: extent))
+        return blurred(m.clampedToExtent(), 2).cropped(to: extent)
+    }
+
     /// Objekt(e) im aufgezogenen Kästchen hinzufügen oder entfernen.
     @discardableResult
     func boxSelect(_ box: CGRect, add: Bool) -> Bool {
@@ -408,14 +443,15 @@ final class CutoutEngine: ObservableObject {
         guard b.width > 8, b.height > 8 else { return false }
         if let sel = visionLabels(in: b), !sel.isEmpty {
             pushUndo()
-            if add { selected.formUnion(sel) } else { selected.subtract(sel) }
+            if eff(add) { selected.formUnion(sel) } else { selected.subtract(sel) }
             rebuild()
             return true
         }
-        guard let m = colorBoxMask(b) else { return false }
+        // Farbbasiert; wenn das nichts ergibt, wird der Kästchen-Inhalt selbst genommen
+        let m = colorBoxMask(b) ?? rectMask(b)
         pushUndo()
-        strokes.append((m, add))
-        baseMask = bake(applyOne(m, add: add, to: baseMask).cropped(to: extent))
+        strokes.append((m, eff(add)))
+        baseMask = bake(applyOne(m, add: eff(add), to: baseMask).cropped(to: extent))
         renderPreview()
         return true
     }
@@ -448,8 +484,8 @@ final class CutoutEngine: ObservableObject {
         let soft = (1 - hardness) * Double(radius) * 0.5
         if soft > 0.5 { s = blurred(s, soft * 2) }
         pushUndo()
-        strokes.append((s, add))
-        baseMask = bake(applyOne(s, add: add, to: baseMask).cropped(to: extent))
+        strokes.append((s, eff(add)))
+        baseMask = bake(applyOne(s, add: eff(add), to: baseMask).cropped(to: extent))
         renderPreview()
     }
 
@@ -457,6 +493,7 @@ final class CutoutEngine: ObservableObject {
 
     private func refined() -> CIImage {
         var m = baseMask
+        if inverted { m = m.applyingFilter("CIColorInvert").cropped(to: extent) }
         if shift != 0 {
             let name = shift > 0 ? "CIMorphologyMaximum" : "CIMorphologyMinimum"
             m = ci(name, m.clampedToExtent(), ["inputRadius": abs(shift)]).cropped(to: extent)
@@ -721,10 +758,11 @@ struct SmartcutView: View {
 
     private var refine: some View {
         VStack(spacing: 8) {
+            Toggle("Umkehren (Ausgeschnittenes ↔ Entferntes)", isOn: $e.inverted)
             HStack { Text("Kante weich").frame(width: 100, alignment: .leading); Slider(value: $e.feather, in: 0...20) }
             HStack { Text("Glätten").frame(width: 100, alignment: .leading); Slider(value: $e.smooth, in: 0...1) }
             HStack { Text("Kante verschieben").frame(width: 100, alignment: .leading); Slider(value: $e.shift, in: -8...8) }
-            Toggle("Entfernten Bereich rot zeigen", isOn: $e.showRed).padding(.top, 2)
+            Toggle("Entfernten Bereich zeigen", isOn: $e.showRed).padding(.top, 2)
         }
         .padding(.horizontal)
     }
