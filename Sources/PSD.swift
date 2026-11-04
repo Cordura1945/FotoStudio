@@ -956,6 +956,8 @@ struct ActivityView: UIViewControllerRepresentable {
 struct PSDScreen: View {
     @StateObject private var m = PSDModel()
     @State private var showImporter = false
+    @ObservedObject private var incoming = Incoming.shared
+    @State private var localFiles: [URL] = []
     @State private var dropping = false
     @State private var tab: PTab = .move
     @State private var showLayers = false
@@ -1025,6 +1027,13 @@ struct PSDScreen: View {
             }
         }
         .onChange(of: photoItems) { _, items in loadPhotos(items) }
+        .task(id: incoming.url) {
+            if let u = incoming.url {
+                incoming.url = nil
+                openFile(u)
+            }
+        }
+        .onAppear { refreshLocal() }
         .task(id: m.message) {
             if m.message != nil {
                 try? await Task.sleep(nanoseconds: 8_000_000_000)
@@ -1061,8 +1070,30 @@ struct PSDScreen: View {
                     .padding(.horizontal, 20).padding(.vertical, 10)
                     .background(Color(white: 0.18), in: Capsule()).foregroundStyle(.white)
             }
-            Text("Du findest die Datei in „Dateien“ (iCloud Drive oder Auf meinem iPhone).")
+            Text("Tipp: Lege PSD-Dateien in „Dateien“ → „Auf meinem iPhone“ → „FotoStudio“ ab. Sie erscheinen dann hier. Oder: PSD in „Dateien“ lange drücken → Teilen → FotoStudio.")
                 .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center).padding(.horizontal, 30)
+            if !localFiles.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("PSD-Dateien im App-Ordner").font(.subheadline.bold())
+                    ForEach(localFiles, id: \.self) { u in
+                        Button { openFile(u) } label: {
+                            HStack {
+                                Image(systemName: "doc.richtext")
+                                Text(u.lastPathComponent).lineLimit(1)
+                                Spacer()
+                                Text(fileSize(u)).font(.caption).foregroundStyle(.secondary)
+                            }
+                            .padding(10)
+                            .background(Color(white: 0.15), in: RoundedRectangle(cornerRadius: 10))
+                            .foregroundStyle(.white)
+                        }
+                    }
+                }
+                .padding(.horizontal, 24)
+            }
+            Button { refreshLocal() } label: {
+                Label("Ordner aktualisieren", systemImage: "arrow.clockwise").font(.footnote)
+            }
         }
     }
 
@@ -1162,6 +1193,24 @@ struct PSDScreen: View {
     }
 
     // MARK: Dateien
+
+    private func refreshLocal() {
+        let fm = FileManager.default
+        guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        var found: [URL] = []
+        for dir in [docs, docs.appendingPathComponent("Inbox")] {
+            if let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+                found += items.filter { $0.pathExtension.lowercased() == "psd" }
+            }
+        }
+        localFiles = found.sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    private func fileSize(_ u: URL) -> String {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: u.path)
+        let n = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+        return String(format: "%.1f MB", Double(n) / 1_048_576)
+    }
 
     private func openFile(_ url: URL) {
         let fileName = url.lastPathComponent
