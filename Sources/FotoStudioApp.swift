@@ -16,6 +16,9 @@ struct FotoStudioApp: App {
     }
 }
 
+/// Wird bei jeder Lieferung hochgezählt, damit man sieht, welche Fassung installiert ist.
+let appBuildTag = "Build 9"
+
 // MARK: - Startseite (Aufbau wie Photoshop Express)
 
 struct HomeView: View {
@@ -65,6 +68,11 @@ struct HomeView: View {
                                      colors: [Color(red: 0.08, green: 0.68, blue: 0.62), Color(red: 0.15, green: 0.78, blue: 0.42)])
                         }
                         .buttonStyle(.plain)
+
+                        Text("Version \(appBuildTag)")
+                            .font(.caption2).foregroundStyle(.white.opacity(0.4))
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 10)
                     }
                     .padding(.horizontal, 18)
                     .padding(.bottom, 30)
