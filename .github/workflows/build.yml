@@ -19,6 +19,7 @@ jobs:
 
       - name: Bauen (unsigniert)
         run: |
+          set +e
           xcodebuild -project FotoStudio.xcodeproj \
             -scheme FotoStudio \
             -configuration Release \
@@ -26,7 +27,12 @@ jobs:
             -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            build
+            build > build.log 2>&1
+          code=$?
+          echo "===== FEHLER ====="
+          grep -E "error:" build.log | sort -u | head -40
+          echo "===== ENDE ====="
+          exit $code
 
       - name: IPA packen
         run: |
