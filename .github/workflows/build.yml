@@ -1,0 +1,40 @@
+name: Build IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: XcodeGen installieren
+        run: brew install xcodegen
+
+      - name: Projekt erzeugen
+        run: xcodegen generate
+
+      - name: Bauen (unsigniert)
+        run: |
+          xcodebuild -project FotoStudio.xcodeproj \
+            -scheme FotoStudio \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: IPA packen
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/FotoStudio.app Payload/
+          zip -r FotoStudio.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FotoStudio-ipa
+          path: FotoStudio.ipa
