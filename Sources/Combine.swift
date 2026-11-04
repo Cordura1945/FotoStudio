@@ -700,7 +700,7 @@ final class CombineModel: ObservableObject {
                 update(id) { $0.cut = out }
                 refresh(id)
             } else {
-                message = "Kein Motiv erkannt"
+                message = "Kein Motiv erkannt – nutze Benutzerdef."
             }
         }
     }
