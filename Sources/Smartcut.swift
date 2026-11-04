@@ -237,6 +237,189 @@ final class CutoutEngine: ObservableObject {
         return true
     }
 
+    // MARK: Kästchen aufziehen
+
+    private func bitmap(maxSide: CGFloat) -> (px: [UInt8], w: Int, h: Int, sc: CGFloat)? {
+        guard let cg = source.cgImage else { return nil }
+        let sc = min(1, maxSide / max(extent.width, extent.height))
+        let w = Int((extent.width * sc).rounded())
+        let h = Int((extent.height * sc).rounded())
+        guard w > 8, h > 8 else { return nil }
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        let ok: Bool = px.withUnsafeMutableBytes { raw in
+            guard let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8,
+                                      bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        return ok ? (px, w, h, sc) : nil
+    }
+
+    private func maskImage(_ mask: [UInt8], w: Int, h: Int) -> CIImage? {
+        guard let prov = CGDataProvider(data: Data(mask) as CFData),
+              let mcg = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 8, bytesPerRow: w,
+                                space: CGColorSpaceCreateDeviceGray(),
+                                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                                provider: prov, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+        else { return nil }
+        let m = CIImage(cgImage: mcg)
+            .transformed(by: CGAffineTransform(scaleX: extent.width / CGFloat(w), y: extent.height / CGFloat(h)))
+        return blurred(m.clampedToExtent(), 2).cropped(to: extent)
+    }
+
+    /// Erkannte Objekte, die zu mindestens 60 % im Kästchen liegen.
+    private func visionLabels(in b: CGRect) -> IndexSet? {
+        guard let bd = bundle else { return nil }
+        let buf = bd.obs.instanceMask
+        CVPixelBufferLockBaseAddress(buf, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buf, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buf) else { return nil }
+        let w = CVPixelBufferGetWidth(buf)
+        let h = CVPixelBufferGetHeight(buf)
+        let bpr = CVPixelBufferGetBytesPerRow(buf)
+        let x0 = Int(b.minX / extent.width * CGFloat(w)), x1 = Int(b.maxX / extent.width * CGFloat(w))
+        let y0 = Int(b.minY / extent.height * CGFloat(h)), y1 = Int(b.maxY / extent.height * CGFloat(h))
+        var total: [Int: Int] = [:]
+        var inside: [Int: Int] = [:]
+        for y in 0..<h {
+            for x in 0..<w {
+                let v = Int(base.load(fromByteOffset: y * bpr + x, as: UInt8.self))
+                if v == 0 { continue }
+                total[v, default: 0] += 1
+                if x >= x0 && x < x1 && y >= y0 && y < y1 { inside[v, default: 0] += 1 }
+            }
+        }
+        var out = IndexSet()
+        for (k, t) in total where Double(inside[k] ?? 0) / Double(t) >= 0.6 { out.insert(k) }
+        return out
+    }
+
+    /// Farbbasierte Auswahl im Kästchen: Hintergrund wird aus dem Rand um das Kästchen gelernt.
+    private func colorBoxMask(_ b: CGRect) -> CIImage? {
+        guard let bm = bitmap(maxSide: 420) else { return nil }
+        let px = bm.px, w = bm.w, h = bm.h, sc = bm.sc
+        let x0 = max(0, Int(b.minX * sc)), y0 = max(0, Int(b.minY * sc))
+        let x1 = min(w, Int(b.maxX * sc)), y1 = min(h, Int(b.maxY * sc))
+        let bw = x1 - x0, bh = y1 - y0
+        guard bw > 6, bh > 6 else { return nil }
+        func rgb(_ x: Int, _ y: Int) -> SIMD3<Float> {
+            let o = (y * w + x) * 4
+            return SIMD3<Float>(Float(px[o]), Float(px[o + 1]), Float(px[o + 2]))
+        }
+        let rw = max(3, Int(0.08 * Float(min(bw, bh))))
+        var ring: [SIMD3<Float>] = []
+        let ox0 = max(0, x0 - rw), oy0 = max(0, y0 - rw), ox1 = min(w, x1 + rw), oy1 = min(h, y1 + rw)
+        for y in oy0..<oy1 {
+            for x in ox0..<ox1 {
+                if x >= x0 && x < x1 && y >= y0 && y < y1 { continue }
+                ring.append(rgb(x, y))
+            }
+        }
+        if ring.count < 40 {
+            ring = []
+            for y in y0..<y1 {
+                for x in x0..<x1 where x < x0 + rw || x >= x1 - rw || y < y0 + rw || y >= y1 - rw {
+                    ring.append(rgb(x, y))
+                }
+            }
+        }
+        guard ring.count >= 20 else { return nil }
+
+        // k-Means (k = 4) auf den Hintergrundfarben
+        let sorted = ring.sorted { ($0.x + $0.y + $0.z) < ($1.x + $1.y + $1.z) }
+        var centers: [SIMD3<Float>] = (0..<4).map { sorted[min(sorted.count - 1, (2 * $0 + 1) * sorted.count / 8)] }
+        func nearest(_ c: SIMD3<Float>) -> (Int, Float) {
+            var bi = 0
+            var bd = Float.infinity
+            for (i, k) in centers.enumerated() {
+                let d = c - k
+                let dd = (d.x * d.x + d.y * d.y + d.z * d.z).squareRoot()
+                if dd < bd { bd = dd; bi = i }
+            }
+            return (bi, bd)
+        }
+        for _ in 0..<6 {
+            var sum = [SIMD3<Float>](repeating: .zero, count: 4)
+            var cnt = [Float](repeating: 0, count: 4)
+            for c in ring { let i = nearest(c).0; sum[i] += c; cnt[i] += 1 }
+            for i in 0..<4 where cnt[i] > 0 { centers[i] = sum[i] / cnt[i] }
+        }
+        let rd = ring.map { nearest($0).1 }.sorted()
+        let p95 = rd[Int(Float(rd.count - 1) * 0.95)]
+        let tau = max(26, p95 * 1.4)
+
+        var fg = [UInt8](repeating: 0, count: w * h)
+        for y in y0..<y1 {
+            for x in x0..<x1 where nearest(rgb(x, y)).1 > tau { fg[y * w + x] = 1 }
+        }
+
+        // kleine Flecken entfernen (zusammenhängende Bereiche prüfen)
+        var label = [Int32](repeating: 0, count: w * h)
+        var keep = [UInt8](repeating: 0, count: w * h)
+        let minArea = max(30, bw * bh / 50)
+        var nextLabel: Int32 = 0
+        for y in y0..<y1 {
+            for x in x0..<x1 where fg[y * w + x] == 1 && label[y * w + x] == 0 {
+                nextLabel += 1
+                var stack = [(x, y)]
+                var comp: [Int] = []
+                label[y * w + x] = nextLabel
+                while let (cx, cy) = stack.popLast() {
+                    comp.append(cy * w + cx)
+                    for (nx, ny) in [(cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)] {
+                        guard nx >= x0, nx < x1, ny >= y0, ny < y1,
+                              fg[ny * w + nx] == 1, label[ny * w + nx] == 0 else { continue }
+                        label[ny * w + nx] = nextLabel
+                        stack.append((nx, ny))
+                    }
+                }
+                if comp.count >= minArea { for i in comp { keep[i] = 1 } }
+            }
+        }
+
+        // Löcher füllen: alles, was vom Kästchenrand aus nicht erreichbar ist, gehört zum Objekt
+        var reach = [UInt8](repeating: 0, count: w * h)
+        var st: [(Int, Int)] = []
+        func seed(_ x: Int, _ y: Int) {
+            if keep[y * w + x] == 0 && reach[y * w + x] == 0 { reach[y * w + x] = 1; st.append((x, y)) }
+        }
+        for x in x0..<x1 { seed(x, y0); seed(x, y1 - 1) }
+        for y in y0..<y1 { seed(x0, y); seed(x1 - 1, y) }
+        while let (cx, cy) = st.popLast() {
+            for (nx, ny) in [(cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)] {
+                guard nx >= x0, nx < x1, ny >= y0, ny < y1 else { continue }
+                seed(nx, ny)
+            }
+        }
+        var mask = [UInt8](repeating: 0, count: w * h)
+        var count = 0
+        for y in y0..<y1 {
+            for x in x0..<x1 where reach[y * w + x] == 0 { mask[y * w + x] = 255; count += 1 }
+        }
+        guard count > 20 else { return nil }
+        return maskImage(mask, w: w, h: h)
+    }
+
+    /// Objekt(e) im aufgezogenen Kästchen hinzufügen oder entfernen.
+    @discardableResult
+    func boxSelect(_ box: CGRect, add: Bool) -> Bool {
+        let b = box.intersection(CGRect(origin: .zero, size: extent.size))
+        guard b.width > 8, b.height > 8 else { return false }
+        if let sel = visionLabels(in: b), !sel.isEmpty {
+            pushUndo()
+            if add { selected.formUnion(sel) } else { selected.subtract(sel) }
+            rebuild()
+            return true
+        }
+        guard let m = colorBoxMask(b) else { return false }
+        pushUndo()
+        strokes.append((m, add))
+        baseMask = bake(applyOne(m, add: add, to: baseMask).cropped(to: extent))
+        renderPreview()
+        return true
+    }
+
     // MARK: Pinsel
 
     func paint(points: [CGPoint], radius: CGFloat, hardness: Double, add: Bool) {
@@ -345,6 +528,8 @@ struct SmartcutView: View {
     @State private var brush = 0.06
     @State private var hardness = 0.6
     @State private var pts: [CGPoint] = []
+    @State private var boxStart: CGPoint?
+    @State private var boxCur: CGPoint?
     @State private var note: String?
 
     init(image: UIImage, startAll: Bool, onDone: @escaping (UIImage?) -> Void) {
@@ -405,15 +590,39 @@ struct SmartcutView: View {
                                                        lineCap: .round, lineJoin: .round))
                             .allowsHitTesting(false)
                         }
+                        if let a = boxStart, let c = boxCur {
+                            let br = CGRect(x: min(a.x, c.x), y: min(a.y, c.y), width: abs(a.x - c.x), height: abs(a.y - c.y))
+                            Rectangle().fill((tab == 0 ? Color.blue : Color.red).opacity(0.12))
+                                .overlay(Rectangle().strokeBorder(Color.white, style: StrokeStyle(lineWidth: 2, dash: [8, 5])))
+                                .frame(width: br.width, height: br.height)
+                                .position(x: br.midX, y: br.midY)
+                                .allowsHitTesting(false)
+                        }
                         Color.clear.contentShape(Rectangle())
                             .gesture(
                                 DragGesture(minimumDistance: 0)
                                     .onChanged { v in
-                                        guard tab != 2, tool == 1 else { return }
+                                        guard tab != 2 else { return }
+                                        if tool == 0 {
+                                            if boxStart == nil { boxStart = v.startLocation }
+                                            boxCur = v.location
+                                            return
+                                        }
                                         if let l = pts.last, hypot(l.x - v.location.x, l.y - v.location.y) < 2 { return }
                                         pts.append(v.location)
                                     }
-                                    .onEnded { v in finish(v.location, rect: r, scale: s, imgSize: img.size) }
+                                    .onEnded { v in
+                                        if tool == 0, tab != 2 {
+                                            let a = boxStart ?? v.startLocation
+                                            boxStart = nil
+                                            boxCur = nil
+                                            if hypot(v.location.x - a.x, v.location.y - a.y) > 24 {
+                                                finishBox(a, v.location, rect: r, scale: s, imgSize: img.size)
+                                                return
+                                            }
+                                        }
+                                        finish(v.location, rect: r, scale: s, imgSize: img.size)
+                                    }
                             )
                     }
                 } else {
@@ -431,6 +640,15 @@ struct SmartcutView: View {
     private func toImage(_ p: CGPoint, rect: CGRect, scale: CGFloat, size: CGSize) -> CGPoint {
         CGPoint(x: min(max((p.x - rect.minX) / scale, 0), size.width),
                 y: min(max((p.y - rect.minY) / scale, 0), size.height))
+    }
+
+    private func finishBox(_ a: CGPoint, _ c: CGPoint, rect: CGRect, scale: CGFloat, imgSize: CGSize) {
+        let p1 = toImage(a, rect: rect, scale: scale, size: imgSize)
+        let p2 = toImage(c, rect: rect, scale: scale, size: imgSize)
+        let box = CGRect(x: min(p1.x, p2.x), y: min(p1.y, p2.y), width: abs(p1.x - p2.x), height: abs(p1.y - p2.y))
+        if !e.boxSelect(box, add: tab == 0) {
+            note = "Im Kästchen wurde nichts erkannt – ziehe es größer oder nutze den Pinsel"
+        }
     }
 
     private func finish(_ loc: CGPoint, rect: CGRect, scale: CGFloat, imgSize: CGSize) {
@@ -477,8 +695,8 @@ struct SmartcutView: View {
                 } else {
                     HStack { Text("Toleranz").frame(width: 70, alignment: .leading); Slider(value: $tol, in: 5...120) }
                         .padding(.horizontal)
-                    Text((tab == 0 ? "Tippe auf ein Objekt oder einen Bereich, um ihn zum Ausschnitt hinzuzufügen."
-                                   : "Tippe auf ein Objekt oder einen Bereich, um ihn zu entfernen.")
+                    Text((tab == 0 ? "Tippe auf ein Objekt oder ziehe ein Kästchen darum, um es zum Ausschnitt hinzuzufügen."
+                                   : "Tippe auf ein Objekt oder ziehe ein Kästchen darum, um es zu entfernen.")
                          + (e.detected == 0 ? " Kein Motiv erkannt – es wird nach Farbe ausgewählt." : ""))
                         .font(.footnote).foregroundStyle(.secondary).padding(.horizontal)
                 }
