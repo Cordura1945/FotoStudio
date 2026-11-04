@@ -10,6 +10,18 @@ targets:
       - path: Sources
       - path: Assets.xcassets
         optional: true
+    info:
+      path: Info.plist
+      properties:
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: false
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Photoshop-Dokument
+            CFBundleTypeRole: Editor
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - com.adobe.photoshop-image
+              - public.data
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.fotostudio.app
